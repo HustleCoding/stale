@@ -77,6 +77,39 @@ make install    # → /usr/local/bin/stale
 
 Requires Xcode Command Line Tools. No third-party dependencies.
 
+## Distribution
+
+```
+make dist                    # → dist/Stale-<VERSION>.zip + .dmg, universal, ad-hoc signed
+make dist SIGN_IDENTITY="Developer ID Application: Name (TEAMID)"
+make notarize SIGN_IDENTITY="Developer ID Application: Name (TEAMID)"   # notarize + staple app and DMG
+```
+
+Ad-hoc builds run locally but Gatekeeper warns on download (right-click → Open).
+`make notarize` expects a notarytool keychain profile named `stale`
+(`xcrun notarytool store-credentials stale --apple-id … --team-id … --password <app-specific>`).
+
+### Releasing from GitHub Actions
+
+Pushing a `v*` tag (`git tag v1.0.0 && git push --tags`) runs the `release` job in
+[`.github/workflows/build.yml`](.github/workflows/build.yml): it builds the universal
+app, signs it with your Developer ID, notarizes with Apple, staples, and attaches
+`Stale-<version>.zip`, `.dmg` and `SHA256SUMS.txt` to a GitHub Release.
+
+Add these repository secrets (Settings → Secrets and variables → Actions):
+
+| secret | value |
+| --- | --- |
+| `MACOS_CERTIFICATE_P12` | base64 of your **Developer ID Application** certificate + private key: export it from Keychain Access as `.p12`, then `base64 -i cert.p12 \| pbcopy` |
+| `MACOS_CERTIFICATE_PASSWORD` | the password you chose when exporting the `.p12` |
+| `APPLE_ID` | Apple ID e-mail of the developer account |
+| `APPLE_TEAM_ID` | 10-character Team ID (the part in parentheses in the certificate name) |
+| `APPLE_APP_PASSWORD` | an [app-specific password](https://appleid.apple.com/account/manage) for that Apple ID |
+
+The certificate is imported into a throw-away keychain on the runner and deleted
+afterwards. If the secrets are missing, the release job still publishes an ad-hoc
+signed build and marks the release as not notarized.
+
 ## Notes
 
 - Give your terminal **Full Disk Access** (System Settings → Privacy & Security) to
