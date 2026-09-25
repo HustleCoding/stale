@@ -741,6 +741,7 @@ struct RingSeg {
   NSTimer* _persistTimer;
   NSString* _sortKey;
   BOOL _sortAscending;
+  std::string _launchRoot;  // folder handed over by Finder/`open` before the window exists
 }
 
 // ───── app lifecycle ─────
@@ -752,8 +753,9 @@ struct RingSeg {
   _mode = Mode::Overview;
   [self buildMenus];
   [self buildWindow];
+  [self installEscapeMonitor];
   [NSApp activateIgnoringOtherApps:YES];
-  std::string start = "/";
+  std::string start = _launchRoot.empty() ? "/" : _launchRoot;
   NSArray<NSString*>* args = NSProcessInfo.processInfo.arguments;
   if (args.count > 1 && ![args[1] hasPrefix:@"-"]) {
     BOOL isDir = NO;
@@ -776,8 +778,23 @@ struct RingSeg {
 - (BOOL)application:(NSApplication*)app openFile:(NSString*)path {
   BOOL isDir = NO;
   if (![NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&isDir] || !isDir) return NO;
-  [self openRoot:std_str(path.stringByStandardizingPath)];
+  std::string root = std_str(path.stringByStandardizingPath);
+  if (_window) [self openRoot:root];
+  else _launchRoot = root;  // cold launch: this arrives before applicationDidFinishLaunching
   return YES;
+}
+
+// Escape stops an in-flight scan unless a text field owns the key (it uses Escape itself).
+- (void)installEscapeMonitor {
+  __weak StaleController* weakSelf = self;
+  [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                        handler:^NSEvent*(NSEvent* e) {
+    StaleController* s = weakSelf;
+    if (!s || e.keyCode != 53 || !s->_scanning || e.window != s->_window) return e;
+    if ([s->_window.firstResponder isKindOfClass:NSText.class]) return e;
+    [s cancelScan:nil];
+    return nil;
+  }];
 }
 
 - (void)buildMenus {
