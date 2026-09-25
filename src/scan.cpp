@@ -260,7 +260,8 @@ struct Walker {
         node.bucketSize[bucketFor(lu, now)] += sz;
         if (never) node.neverOpenedSize += sz;
         if (lu > node.lastUsed) node.lastUsed = lu;
-        files.fetch_add(1);
+        uint64_t f = files.fetch_add(1) + 1;
+        if (opts.progressFiles && (f & 1023) == 0) opts.progressFiles->store(f, std::memory_order_relaxed);
         if (sz >= opts.bigFileBytes) {
           std::lock_guard<std::mutex> lk(resMu);
           big.push_back(FileRec{full, sz, lu, never});
@@ -291,7 +292,13 @@ struct Walker {
         w = std::move(queue.back());
         queue.pop_back();
       }
-      processDir(w);
+      if (opts.cancel && opts.cancel->load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lk(mu);
+        pending.fetch_sub(static_cast<int64_t>(queue.size()));
+        queue.clear();
+      } else {
+        processDir(w);
+      }
       if (pending.fetch_sub(1) == 1) cv.notify_all();
     }
   }
@@ -333,6 +340,9 @@ ScanResult scan(const ScanOptions& opts) {
   res.bigFiles = std::move(walker.big);
   res.files = walker.files.load();
   res.errors = walker.errors.load();
+  if (opts.progressFiles) opts.progressFiles->store(res.files);
+  for (auto& d : res.dirs)
+    if (d.path.empty() && &d != &res.dirs[0]) d.parent = -2;  // never processed (cancelled)
 
   // Roll up children into parents. Children always have larger ids than parents.
   for (int32_t i = static_cast<int32_t>(res.dirs.size()) - 1; i > 0; --i) {
@@ -360,7 +370,34 @@ ScanResult scan(const ScanOptions& opts) {
             [](const FileRec& a, const FileRec& b) { return a.size > b.size; });
 
   res.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  res.spotlight = std::move(md);
   return res;
+}
+
+void collectUnits(const ScanResult& r, int32_t id, std::vector<int32_t>& out,
+                  const std::function<bool(const DirNode&)>& pred) {
+  const DirNode& d = r.dirs[id];
+  if (id != 0 && d.unit) {
+    if (pred(d)) out.push_back(id);
+    return;
+  }
+  for (int32_t c : d.children) collectUnits(r, c, out, pred);
+}
+
+void collectForgotten(const ScanResult& r, int32_t id, std::vector<int32_t>& out, uint64_t minBytes) {
+  const DirNode& d = r.dirs[id];
+  if (d.size < minBytes) return;
+  if (id != 0 && d.unit && categoryReclaimable(d.category)) return;
+  // Judge only the non-regenerable content; reclaimable units are reported separately.
+  uint64_t own = d.size - d.reclaimableSize;
+  uint64_t old = d.bucketSize[STALE] + d.bucketSize[FROZEN] - d.reclaimableBucketSize[STALE] -
+                 d.reclaimableBucketSize[FROZEN];
+  if (id != 0 && own >= minBytes && old * 10 >= own * 9 && bucketFor(d.lastUsed, r.now) >= STALE) {
+    out.push_back(id);
+    return;
+  }
+  if (d.unit && id != 0) return;
+  for (int32_t c : d.children) collectForgotten(r, c, out, minBytes);
 }
 
 }  // namespace stale

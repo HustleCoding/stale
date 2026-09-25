@@ -1,5 +1,7 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -63,6 +65,8 @@ struct ScanOptions {
   uint64_t bigFileBytes = 100ull << 20;
   bool sameDevice = true;
   bool spotlight = true;
+  std::atomic<uint64_t>* progressFiles = nullptr;  // updated while scanning (optional)
+  std::atomic<bool>* cancel = nullptr;             // set to stop early (optional)
 };
 
 struct ScanResult {
@@ -73,6 +77,7 @@ struct ScanResult {
   double now = 0;
   double seconds = 0;
   size_t spotlightHits = 0;
+  std::unordered_map<std::string, double> spotlight;  // path -> last opened, for on-demand file rows
 };
 
 // Spotlight: path -> last used (unix seconds) for everything under root.
@@ -82,5 +87,13 @@ ScanResult scan(const ScanOptions& opts);
 
 // Rollup helper used by reports: mark nodes below `unit` nodes.
 Category classifyDir(const std::string& path, const std::string& name, const std::string& home);
+
+// Top-most unit directories (not nested inside another unit) accepted by `pred`.
+void collectUnits(const ScanResult& r, int32_t id, std::vector<int32_t>& out,
+                  const std::function<bool(const DirNode&)>& pred);
+
+// Highest-level folders (not inside units) whose non-reclaimable content is >=90% stale/frozen
+// and at least `minBytes`.
+void collectForgotten(const ScanResult& r, int32_t id, std::vector<int32_t>& out, uint64_t minBytes);
 
 }  // namespace stale

@@ -8,10 +8,13 @@ namespace stale {
 std::unordered_map<std::string, double> spotlightLastUsed(const std::string& root) {
   std::unordered_map<std::string, double> out;
   @autoreleasepool {
+    NSString* rootStr = [NSFileManager.defaultManager stringWithFileSystemRepresentation:root.c_str()
+                                                                                 length:root.size()];
+    if (!rootStr) return out;
     NSString* q = @"kMDItemLastUsedDate > $time.iso(1970-01-02T00:00:00Z)";
     MDQueryRef query = MDQueryCreate(kCFAllocatorDefault, (__bridge CFStringRef)q, NULL, NULL);
     if (!query) return out;
-    NSArray* scope = @[ [NSString stringWithUTF8String:root.c_str()] ];
+    NSArray* scope = @[ rootStr ];
     MDQuerySetSearchScope(query, (__bridge CFArrayRef)scope, 0);
     if (!MDQueryExecute(query, kMDQuerySynchronous)) {
       CFRelease(query);

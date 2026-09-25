@@ -196,34 +196,6 @@ ScanResult doScan(const Args& a, const std::string& root) {
   return scan(o);
 }
 
-// Top-most unit directories (not nested inside another unit) accepted by `pred`.
-void collectUnits(const ScanResult& r, int32_t id, std::vector<int32_t>& out,
-                  const std::function<bool(const DirNode&)>& pred) {
-  const DirNode& d = r.dirs[id];
-  if (id != 0 && d.unit) {
-    if (pred(d)) out.push_back(id);
-    return;
-  }
-  for (int32_t c : d.children) collectUnits(r, c, out, pred);
-}
-
-// Highest-level folders (not inside units) whose content is ≥90% stale/frozen.
-void collectForgotten(const ScanResult& r, int32_t id, std::vector<int32_t>& out, uint64_t minBytes) {
-  const DirNode& d = r.dirs[id];
-  if (d.size < minBytes) return;
-  if (id != 0 && d.unit && categoryReclaimable(d.category)) return;
-  // Judge only the non-regenerable content; reclaimable units are reported separately.
-  uint64_t own = d.size - d.reclaimableSize;
-  uint64_t old = d.bucketSize[STALE] + d.bucketSize[FROZEN] - d.reclaimableBucketSize[STALE] -
-                 d.reclaimableBucketSize[FROZEN];
-  if (id != 0 && own >= minBytes && old * 10 >= own * 9 && bucketFor(d.lastUsed, r.now) >= STALE) {
-    out.push_back(id);
-    return;
-  }
-  if (d.unit && id != 0) return;
-  for (int32_t c : d.children) collectForgotten(r, c, out, minBytes);
-}
-
 void printRow(const std::string& sz, double lastUsed, double now, const std::string& label,
               const std::string& tag) {
   Bucket b = bucketFor(lastUsed <= 0 ? 0 : lastUsed, now);
