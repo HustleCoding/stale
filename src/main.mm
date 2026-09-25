@@ -105,11 +105,17 @@ std::string jsonEscape(const std::string& s) {
   return o + "\"";
 }
 
+// 30d, 6mo, 1y, 180 — exits on anything else.
 double parseDays(const std::string& s) {
-  // 30d, 6mo, 1y, 180
-  double v = atof(s.c_str());
-  if (s.find("mo") != std::string::npos) return v * 30.44;
-  if (s.find('y') != std::string::npos) return v * 365.25;
+  char* end = nullptr;
+  double v = strtod(s.c_str(), &end);
+  std::string unit = end ? end : "";
+  if (end == s.c_str() || v < 0 || !(unit.empty() || unit == "d" || unit == "mo" || unit == "y")) {
+    fprintf(stderr, "stale: invalid age '%s' (use e.g. 30d, 6mo, 1y)\n", s.c_str());
+    exit(2);
+  }
+  if (unit == "mo") return v * 30.44;
+  if (unit == "y") return v * 365.25;
   return v;
 }
 
@@ -518,6 +524,11 @@ int main(int argc, char** argv) {
   gHome = h ? h : "";
   if (getenv("NO_COLOR")) gColor = false;
   Args a = parse(argc, argv);
+  struct stat st;
+  if (a.cmd != "apps" && (stat(a.path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))) {
+    fprintf(stderr, "stale: %s is not a directory\n", a.path.c_str());
+    return 1;
+  }
   if (a.cmd == "ls") return cmdLs(a);
   if (a.cmd == "apps") return cmdApps(a);
   if (a.cmd == "trash") return cmdTrash(a);
