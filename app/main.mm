@@ -1109,7 +1109,10 @@ static const ModeInfo kModes[] = {
       default: e.badge = nil;
     }
   }
-  [_sidebar reloadData];
+  // Refresh badges in place; reloadData would drop the selection and bounce the mode.
+  if (_sidebar.numberOfRows == 0) [_sidebar reloadData];
+  else [_sidebar reloadDataForRowIndexes:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, (NSUInteger)_sidebar.numberOfRows)]
+                           columnIndexes:[NSIndexSet indexSetWithIndex:0]];
   [self syncSidebar];
 
   // Biggest top-level folders.
