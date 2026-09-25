@@ -92,13 +92,20 @@ $(DMG): $(APP_BIN)
 	hdiutil create -quiet -volname "Stale" -srcfolder $(BUILD)/dmg -ov -format UDZO $@
 	@if [ "$(SIGN_IDENTITY)" != "-" ]; then codesign -f $(SIGN_FLAGS) $@; fi
 
-# Submits the DMG to Apple, waits for the verdict, then staples the ticket so the
-# app opens offline without a Gatekeeper warning. Requires SIGN_IDENTITY.
-notarize: $(DMG)
+# Notarizes the app, staples it, repackages the stapled app into zip + DMG, then
+# notarizes and staples the DMG so both open offline without a Gatekeeper warning.
+# Requires SIGN_IDENTITY and a notarytool keychain profile (NOTARY_PROFILE).
+notarize: $(APP_BIN)
+	@test "$(SIGN_IDENTITY)" != "-" || { echo "notarize needs SIGN_IDENTITY=\"Developer ID Application: ...\""; exit 1; }
+	ditto -c -k --keepParent $(APP) $(BUILD)/notarize.zip
+	xcrun notarytool submit $(BUILD)/notarize.zip --keychain-profile "$(NOTARY_PROFILE)" --wait
+	xcrun stapler staple $(APP)
+	rm -f $(ZIP) $(DMG)
+	$(MAKE) $(ZIP) $(DMG) SIGN_IDENTITY="$(SIGN_IDENTITY)" VERSION="$(VERSION)"
 	xcrun notarytool submit $(DMG) --keychain-profile "$(NOTARY_PROFILE)" --wait
 	xcrun stapler staple $(DMG)
-	xcrun stapler staple $(APP)
 	spctl -a -vv -t open --context context:primary-signature $(DMG)
+	spctl -a -vv $(APP)
 
 verify: $(APP_BIN)
 	codesign --verify --deep --strict --verbose=2 $(APP)
