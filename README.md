@@ -68,14 +68,30 @@ Recognised categories (treated as leaf "units" in reports):
 - Docker/OrbStack/Colima data, `.Trash`
 - `.git`, `*.app`, and macOS bundles (`.photoslibrary`, `.xcodeproj`, `.framework`, …) — shown as one item, never split
 
+## Stale.app
+
+The Mac app (`make app`, or the DMG from Releases) indexes the whole disk (`/`)
+once and remembers the result in `~/Library/Application Support/Stale/`, so later
+launches open instantly from the saved index — the header shows how old it is
+("Indexed 3 h ago"). It only re-indexes when you click **Rescan**; moving items to
+the Trash from the app updates the saved index in place. Open a different folder
+with the folder button (or `open -a Stale <path>`); each root keeps its own index.
+
+The Overview shows what's on the disk as a two-level segmented ring plus a bar of
+recency buckets; the sidebar groups reclaimable data (Safe to delete), forgotten
+folders, big unused files and unused apps. Nothing is ever deleted — everything
+goes to the Trash.
+
 ## Build
 
 ```
-make            # → build/stale (clang++, Foundation + CoreServices only)
-make install    # → /usr/local/bin/stale
+make            # → build/stale (CLI) + build/Stale.app, universal (arm64 + x86_64)
+make ARCHS=arm64  # quicker local build
+make install    # → /usr/local/bin/stale + /Applications/Stale.app
 ```
 
-Requires Xcode Command Line Tools. No third-party dependencies.
+Requires Xcode Command Line Tools. No third-party dependencies. The app icon and
+the DMG background are rendered at build time (`app/mkicon.mm`, `app/mkdmgbg.mm`).
 
 ## Distribution
 
@@ -85,7 +101,10 @@ make dist SIGN_IDENTITY="Developer ID Application: Name (TEAMID)"
 make notarize SIGN_IDENTITY="Developer ID Application: Name (TEAMID)"   # notarize + staple app and DMG
 ```
 
-Ad-hoc builds run locally but Gatekeeper warns on download (right-click → Open).
+The DMG (`app/dmg.sh`) opens as a "drag Stale to Applications" window with a custom
+background and volume icon; the Finder layout step is skipped with a warning if
+AppleScript is unavailable. Ad-hoc builds run locally but Gatekeeper warns on
+download (right-click → Open).
 `make notarize` expects a notarytool keychain profile named `stale`
 (`xcrun notarytool store-credentials stale --apple-id … --team-id … --password <app-specific>`).
 
@@ -112,8 +131,9 @@ signed build and marks the release as not notarized.
 
 ## Notes
 
-- Give your terminal **Full Disk Access** (System Settings → Privacy & Security) to
-  read `~/Library/Mail`, Safari, Messages, etc.; otherwise they are counted as unreadable.
+- Give your terminal / Stale.app **Full Disk Access** (System Settings → Privacy &
+  Security) to read `~/Library/Mail`, Safari, Messages, etc.; otherwise they are
+  counted as unreadable and the app shows a banner offering to open that setting.
 - Spotlight must be enabled for the volume (`mdutil -s /`). Without it the tool
   falls back to modified time only.
 - `trash` uses `NSFileManager.trashItemAtURL`, so everything is recoverable from

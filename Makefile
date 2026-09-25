@@ -26,11 +26,12 @@ NOTARY_PROFILE ?= stale
 
 BUILD = build
 SRC = src
-CORE = $(BUILD)/scan.o $(BUILD)/spotlight.o
+CORE = $(BUILD)/scan.o $(BUILD)/spotlight.o $(BUILD)/index.o
 OBJS = $(CORE) $(BUILD)/main.o
 APP = $(BUILD)/Stale.app
 APP_BIN = $(APP)/Contents/MacOS/Stale
 ICON = $(BUILD)/Stale.icns
+DMG_BG = $(BUILD)/dmg-background.tiff
 DIST = dist
 ZIP = $(DIST)/Stale-$(VERSION).zip
 DMG = $(DIST)/Stale-$(VERSION).dmg
@@ -52,7 +53,7 @@ $(APP_BIN): $(CORE) $(BUILD)/app.o app/Info.plist app/Stale.entitlements $(ICON)
 	$(CXX) $(CORE) $(BUILD)/app.o $(LDFLAGS) -framework Cocoa -o $@
 	codesign -f $(SIGN_FLAGS) --entitlements app/Stale.entitlements $(APP)
 
-$(BUILD)/app.o: app/main.mm $(SRC)/scan.h | $(BUILD)
+$(BUILD)/app.o: app/main.mm $(SRC)/scan.h $(SRC)/index.h | $(BUILD)
 	$(CXX) $(OBJCXXFLAGS) $(ARCHFLAGS) -c $< -o $@
 
 $(BUILD)/mkicon: app/mkicon.mm | $(BUILD)
@@ -63,10 +64,17 @@ $(ICON): $(BUILD)/mkicon
 	$(BUILD)/mkicon $(BUILD)/Stale.iconset
 	iconutil -c icns $(BUILD)/Stale.iconset -o $@
 
+$(BUILD)/mkdmgbg: app/mkdmgbg.mm | $(BUILD)
+	$(CXX) $(OBJCXXFLAGS) $< -framework Cocoa -o $@
+
+$(DMG_BG): $(BUILD)/mkdmgbg
+	$(BUILD)/mkdmgbg $(BUILD)/dmg-bg.png $(BUILD)/dmg-bg@2x.png
+	tiffutil -cathidpicheck $(BUILD)/dmg-bg.png $(BUILD)/dmg-bg@2x.png -out $@
+
 run: $(APP_BIN)
 	open $(APP)
 
-$(BUILD)/%.o: $(SRC)/%.cpp $(SRC)/scan.h | $(BUILD)
+$(BUILD)/%.o: $(SRC)/%.cpp $(SRC)/scan.h $(SRC)/index.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(ARCHFLAGS) -c $< -o $@
 
 $(BUILD)/%.o: $(SRC)/%.mm $(SRC)/scan.h | $(BUILD)
@@ -84,12 +92,9 @@ $(ZIP): $(APP_BIN)
 	rm -f $@
 	ditto -c -k --keepParent $(APP) $@
 
-$(DMG): $(APP_BIN)
-	mkdir -p $(DIST) $(BUILD)/dmg
-	rm -rf $(BUILD)/dmg/* $@
-	cp -R $(APP) $(BUILD)/dmg/
-	ln -s /Applications $(BUILD)/dmg/Applications
-	hdiutil create -quiet -volname "Stale" -srcfolder $(BUILD)/dmg -ov -format UDZO $@
+$(DMG): $(APP_BIN) $(DMG_BG) app/dmg.sh
+	mkdir -p $(DIST)
+	bash app/dmg.sh $(APP) $(DMG_BG) $(ICON) $@
 	@if [ "$(SIGN_IDENTITY)" != "-" ]; then codesign -f $(SIGN_FLAGS) $@; fi
 
 # Notarizes the app, staples it, repackages the stapled app into zip + DMG, then

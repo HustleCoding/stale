@@ -1,11 +1,14 @@
 // Stale.app — a native window over the stale scanner.
 // Sidebar of views (Overview, All folders, Safe to delete, Forgotten, Big unused files, Apps),
 // a folder tree with size / last-used / what-is-it columns, and a "Move to Trash" action.
-// Everything goes to the Trash, nothing is deleted outright.
+// The whole disk is indexed once and kept in ~/Library/Application Support/Stale; the app
+// opens from that index and only rescans when asked. Everything goes to the Trash, nothing
+// is deleted outright.
 #import <Cocoa/Cocoa.h>
 
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -14,11 +17,12 @@
 #include <string>
 #include <vector>
 
+#include "../src/index.h"
 #include "../src/scan.h"
 
 using namespace stale;
 
-// ───────────────────────────── helpers ─────────────────────────────
+// ───────────────────────────── formatting ─────────────────────────────
 
 static NSString* fmtBytes(uint64_t b) {
   static NSByteCountFormatter* f = [] {
@@ -54,23 +58,91 @@ static NSString* fmtAgo(double t, double now) {
   return [NSString stringWithFormat:@"%.0f years ago", y];
 }
 
+// "just now", "12 min ago", "3 h ago", "yesterday", "5 days ago", "12 Sep 2026"
+static NSString* fmtIndexedAgo(double t, double now) {
+  double s = now - t;
+  if (s < 90) return @"just now";
+  if (s < 3600) return [NSString stringWithFormat:@"%.0f min ago", s / 60];
+  if (s < 86400) return [NSString stringWithFormat:@"%.0f h ago", s / 3600];
+  if (s < 2 * 86400) return @"yesterday";
+  if (s < 14 * 86400) return [NSString stringWithFormat:@"%.0f days ago", s / 86400];
+  return [NSDateFormatter localizedStringFromDate:[NSDate dateWithTimeIntervalSince1970:t]
+                                        dateStyle:NSDateFormatterMediumStyle
+                                        timeStyle:NSDateFormatterNoStyle];
+}
+
+static NSString* fmtDateTime(double t) {
+  return [NSDateFormatter localizedStringFromDate:[NSDate dateWithTimeIntervalSince1970:t]
+                                        dateStyle:NSDateFormatterMediumStyle
+                                        timeStyle:NSDateFormatterShortStyle];
+}
+
+static double unixNow() { return [NSDate date].timeIntervalSince1970; }
+
+// ───────────────────────────── design tokens ─────────────────────────────
+
+static NSColor* hex(uint32_t rgb) {
+  return [NSColor colorWithSRGBRed:((rgb >> 16) & 255) / 255.0
+                             green:((rgb >> 8) & 255) / 255.0
+                              blue:(rgb & 255) / 255.0
+                             alpha:1];
+}
+
+// One colour that flips with the window appearance.
+static NSColor* dyn(NSString* name, uint32_t light, uint32_t dark) {
+  NSColor* l = hex(light);
+  NSColor* d = hex(dark);
+  return [NSColor colorWithName:name dynamicProvider:^NSColor*(NSAppearance* a) {
+    NSAppearanceName best = [a bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
+    return [best isEqual:NSAppearanceNameDarkAqua] ? d : l;
+  }];
+}
+
 static NSColor* kBucketColors[NBUCKETS + 1];  // + never opened
 static NSString* kBucketLabels[NBUCKETS + 1] = {@"This week", @"This month", @"Last 6 months", @"6–12 months",
                                                 @"Over a year", @"Never opened"};
+static const int kRingPalette = 12;
+static NSColor* kRingColors[kRingPalette];
+static NSColor* kRingOther;
 
 static void initColors() {
-  kBucketColors[HOT] = NSColor.systemGreenColor;
-  kBucketColors[WARM] = NSColor.systemTealColor;
-  kBucketColors[COLD] = NSColor.systemYellowColor;
-  kBucketColors[STALE] = NSColor.systemOrangeColor;
-  kBucketColors[FROZEN] = NSColor.systemRedColor;
-  kBucketColors[NBUCKETS] = NSColor.systemGrayColor;
+  kBucketColors[HOT] = dyn(@"hot", 0x22C55E, 0x4ADE80);
+  kBucketColors[WARM] = dyn(@"warm", 0x14B8A6, 0x2DD4BF);
+  kBucketColors[COLD] = dyn(@"cold", 0x3B82F6, 0x60A5FA);
+  kBucketColors[STALE] = dyn(@"stale", 0xF59E0B, 0xFBBF24);
+  kBucketColors[FROZEN] = dyn(@"frozen", 0xF43F5E, 0xFB7185);
+  kBucketColors[NBUCKETS] = dyn(@"never", 0x94A3B8, 0x64748B);
+  const uint32_t light[kRingPalette] = {0x6366F1, 0x0EA5E9, 0x14B8A6, 0x10B981, 0x84CC16, 0xF59E0B,
+                                        0xF97316, 0xF43F5E, 0xEC4899, 0xA855F7, 0x3B82F6, 0x06B6D4};
+  const uint32_t dark[kRingPalette] = {0x818CF8, 0x38BDF8, 0x2DD4BF, 0x34D399, 0xA3E635, 0xFBBF24,
+                                       0xFB923C, 0xFB7185, 0xF472B6, 0xC084FC, 0x60A5FA, 0x22D3EE};
+  for (int i = 0; i < kRingPalette; ++i)
+    kRingColors[i] = dyn([NSString stringWithFormat:@"ring%d", i], light[i], dark[i]);
+  kRingOther = dyn(@"ringOther", 0xCBD5E1, 0x475569);
 }
 
 static NSColor* bucketColor(double lastUsed, double now) {
   if (lastUsed <= 0) return kBucketColors[NBUCKETS];
   return kBucketColors[bucketFor(lastUsed, now)];
 }
+
+static NSColor* surfaceFill() { return dyn(@"surface", 0xFFFFFF, 0x2A2A2E); }
+static NSColor* surfaceStroke() { return dyn(@"surfaceStroke", 0xE6E6EA, 0x3A3A40); }
+
+static NSFont* roundedFont(CGFloat size, NSFontWeight w) {
+  NSFont* base = [NSFont systemFontOfSize:size weight:w];
+  NSFontDescriptor* d = [base.fontDescriptor fontDescriptorWithDesign:NSFontDescriptorSystemDesignRounded];
+  NSFont* f = d ? [NSFont fontWithDescriptor:d size:size] : base;
+  // Tabular digits so sizes don't jiggle as they change.
+  NSFontDescriptor* tab = [f.fontDescriptor fontDescriptorByAddingAttributes:@{
+    NSFontFeatureSettingsAttribute : @[ @{
+      NSFontFeatureTypeIdentifierKey : @(kNumberSpacingType),
+      NSFontFeatureSelectorIdentifierKey : @(kMonospacedNumbersSelector)
+    } ]
+  }];
+  return [NSFont fontWithDescriptor:tab size:size] ?: f;
+}
+static NSFont* monoDigits(CGFloat size, NSFontWeight w) { return [NSFont monospacedDigitSystemFontOfSize:size weight:w]; }
 
 static NSString* categoryTitle(stale::Category c) {
   switch (c) {
@@ -107,6 +179,10 @@ static std::string std_str(NSString* s) { return s ? std::string(s.UTF8String) :
 static NSString* ns_str(const std::string& s) {
   return [NSFileManager.defaultManager stringWithFileSystemRepresentation:s.c_str() length:s.size()] ?: @"";
 }
+static NSString* displayName(NSString* path) {
+  NSString* n = [NSFileManager.defaultManager displayNameAtPath:path];
+  return n.length ? n : path.lastPathComponent;
+}
 static NSImage* symbol(NSString* name, CGFloat pt, NSFontWeight w = NSFontWeightRegular) {
   NSImage* i = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
   return [i imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:pt weight:w]];
@@ -118,6 +194,21 @@ static NSTextField* label(NSString* s, CGFloat size, NSFontWeight w, NSColor* co
   l.maximumNumberOfLines = 1;
   l.lineBreakMode = NSLineBreakByTruncatingTail;
   return l;
+}
+// Adds `v` to `to` filling it with the given insets.
+static void pin(NSView* v, NSView* to, NSEdgeInsets in) {
+  v.translatesAutoresizingMaskIntoConstraints = NO;
+  if (v.superview != to) [to addSubview:v];
+  [NSLayoutConstraint activateConstraints:@[
+    [v.leadingAnchor constraintEqualToAnchor:to.leadingAnchor constant:in.left],
+    [v.trailingAnchor constraintEqualToAnchor:to.trailingAnchor constant:-in.right],
+    [v.topAnchor constraintEqualToAnchor:to.topAnchor constant:in.top],
+    [v.bottomAnchor constraintEqualToAnchor:to.bottomAnchor constant:-in.bottom],
+  ]];
+}
+static void fixSize(NSView* v, CGFloat w, CGFloat h) {
+  if (w > 0) [v.widthAnchor constraintEqualToConstant:w].active = YES;
+  if (h > 0) [v.heightAnchor constraintEqualToConstant:h].active = YES;
 }
 
 // ───────────────────────────── model ─────────────────────────────
@@ -133,7 +224,7 @@ static NSTextField* label(NSString* s, CGFloat size, NSFontWeight w, NSColor* co
 @property(nonatomic) BOOL never;        // created and never opened/modified since
 @property(nonatomic) BOOL isApp;
 @property(nonatomic) stale::Category category;
-@property(nonatomic) int32_t dirId;     // index into ScanResult::dirs, -1 for files
+@property(nonatomic) int32_t dirId;     // index into ScanResult::dirs, -1 for files / foreign apps
 @property(nonatomic, weak) Item* parent;
 @property(nonatomic, strong) NSMutableArray<Item*>* children;  // nil until loaded
 @property(nonatomic, strong) NSImage* icon;
@@ -141,11 +232,84 @@ static NSTextField* label(NSString* s, CGFloat size, NSFontWeight w, NSColor* co
 @implementation Item
 @end
 
+// Where the Apps view gets its bundles from: a subtree of the main index when the scanned
+// root contains /Applications, otherwise a small separate scan of that folder.
+struct AppSource {
+  std::shared_ptr<ScanResult> r;
+  int32_t dirId = -1;
+  bool inMain = false;
+};
+struct AppSources {
+  AppSource s[2];
+};
+
 struct Model {
   std::shared_ptr<ScanResult> result;
-  std::shared_ptr<ScanResult> apps[2];
-  double now = 0;
+  AppSources apps;
+  double now = 0;        // wall clock when the model was installed; ages are relative to this
+  double indexedAt = 0;  // when the scan behind `result` finished
 };
+
+// Walks root→leaf by path components; -1 when `path` isn't a directory of `r`.
+static int32_t findDir(const ScanResult& r, const std::string& path) {
+  if (r.dirs.empty()) return -1;
+  const std::string& root = r.dirs[0].path;
+  if (path == root) return 0;
+  std::string prefix = root.back() == '/' ? root : root + "/";
+  if (path.compare(0, prefix.size(), prefix) != 0) return -1;
+  int32_t cur = 0;
+  size_t pos = prefix.size();
+  for (;;) {
+    size_t next = path.find('/', pos);
+    if (next == std::string::npos) next = path.size();
+    int32_t found = -1;
+    for (int32_t c : r.dirs[cur].children) {
+      const std::string& cp = r.dirs[c].path;
+      if (cp.size() == next && path.compare(0, next, cp) == 0) { found = c; break; }
+    }
+    if (found < 0) return -1;
+    cur = found;
+    if (next == path.size()) return cur;
+    pos = next + 1;
+  }
+}
+
+// Resolve both app folders against `main`; scans (and caches) the ones it doesn't cover.
+static AppSources resolveApps(const std::shared_ptr<ScanResult>& main, const std::string& home,
+                              std::atomic<bool>* cancel) {
+  AppSources out;
+  const std::string roots[2] = {"/Applications", home + "/Applications"};
+  for (int i = 0; i < 2; ++i) {
+    AppSource& s = out.s[i];
+    int32_t id = main ? findDir(*main, roots[i]) : -1;
+    if (id >= 0) {
+      s.r = main;
+      s.dirId = id;
+      s.inMain = true;
+      continue;
+    }
+    struct stat st;
+    if (::stat(roots[i].c_str(), &st) != 0) continue;
+    auto r = std::make_shared<ScanResult>();
+    if (loadIndex(indexPath(roots[i]), roots[i], *r, nullptr)) {
+      s.r = r;
+      s.dirId = 0;
+      continue;
+    }
+    if (cancel && cancel->load()) continue;
+    ScanOptions ao;
+    ao.root = roots[i];
+    ao.cancel = cancel;
+    *r = scan(ao);
+    if (cancel && cancel->load()) continue;
+    if (!r->dirs.empty()) {
+      saveIndex(indexPath(roots[i]), roots[i], *r, unixNow());
+      s.r = r;
+      s.dirId = 0;
+    }
+  }
+  return out;
+}
 
 enum class Mode { Overview = 0, Browse, Reclaim, Forgotten, BigFiles, Apps, Count };
 
@@ -157,24 +321,24 @@ struct ModeInfo {
   NSString* emptyHint;
 };
 static const ModeInfo kModes[] = {
-    {@"Overview", @"chart.pie", @"", @"", @""},
-    {@"All folders", @"folder",
-     @"Everything in this folder, biggest first. Expand a folder to see what's inside; "
-     @"the colour shows how recently something in it was used.",
+    {@"Overview", @"chart.pie.fill", @"", @"", @""},
+    {@"All folders", @"folder.fill",
+     @"Everything on the disk, biggest first. Expand a folder to see what's inside; "
+     @"the dot shows how recently something in it was used.",
      @"Empty folder", @"There's nothing in here."},
     {@"Safe to delete", @"sparkles",
      @"Data that tools generate and can regenerate: npm packages, build output, caches, Xcode and "
      @"Docker data. Deleting it frees space without losing any of your own files.",
-     @"Nothing to regenerate", @"No npm packages, build output, caches or Xcode data in this folder."},
+     @"Nothing to regenerate", @"No npm packages, build output, caches or Xcode data here."},
     {@"Forgotten", @"clock.arrow.circlepath",
      @"Folders of 50 MB or more where nothing has been opened or changed in over 6 months. "
      @"If you don't recognise one, you probably don't need it.",
      @"No forgotten folders", @"Every folder over 50 MB has been touched in the last 6 months."},
-    {@"Big unused files", @"shippingbox",
+    {@"Big unused files", @"shippingbox.fill",
      @"Single files of 100 MB or more untouched for over 6 months: old downloads, installers, "
      @"videos, disk images.",
      @"No big unused files", @"Nothing over 100 MB has gone untouched for 6 months."},
-    {@"Apps", @"app.badge",
+    {@"Apps", @"app.badge.fill",
      @"Apps in /Applications and ~/Applications by when you last launched them (from Spotlight). "
      @"Apps you never open can be removed and reinstalled later.",
      @"No apps found", @"Nothing in /Applications or ~/Applications."},
@@ -182,26 +346,207 @@ static const ModeInfo kModes[] = {
 
 // ───────────────────────────── views ─────────────────────────────
 
-@interface UsageBarView : NSView
-@property(nonatomic) std::vector<double> parts;  // NBUCKETS values
+// Rounded panel with a hairline border; the building block of the Overview page.
+@interface SurfaceView : NSView
+@property(nonatomic) CGFloat radius;
+@property(nonatomic, strong) NSColor* fill;
+@property(nonatomic, strong) NSColor* stroke;
 @end
-@implementation UsageBarView
+@implementation SurfaceView
+- (instancetype)initWithFrame:(NSRect)f {
+  if (!(self = [super initWithFrame:f])) return nil;
+  _radius = 14;
+  _fill = surfaceFill();
+  _stroke = surfaceStroke();
+  return self;
+}
 - (void)drawRect:(NSRect)r {
-  CGFloat rad = self.bounds.size.height / 2;
-  NSBezierPath* clip = [NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:rad yRadius:rad];
+  NSBezierPath* p = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds, 0.5, 0.5) xRadius:_radius yRadius:_radius];
+  [_fill setFill];
+  [p fill];
+  [_stroke setStroke];
+  p.lineWidth = 1;
+  [p stroke];
+}
+@end
+
+// Segmented recency bar with rounded ends and hairline gaps between segments.
+@interface RecencyBarView : NSView
+@property(nonatomic) std::vector<double> parts;  // NBUCKETS values
+@property(nonatomic) CGFloat gap;
+@end
+@implementation RecencyBarView
+- (void)setParts:(std::vector<double>)p { _parts = std::move(p); [self setNeedsDisplay:YES]; }
+- (void)drawRect:(NSRect)r {
+  NSRect b = self.bounds;
+  CGFloat rad = b.size.height / 2;
+  NSBezierPath* clip = [NSBezierPath bezierPathWithRoundedRect:b xRadius:rad yRadius:rad];
   [clip addClip];
   [NSColor.quaternaryLabelColor setFill];
-  NSRectFill(self.bounds);
+  NSRectFill(b);
   double total = 0;
   for (double v : _parts) total += v;
   if (total <= 0) return;
   CGFloat x = 0;
+  CGFloat gap = _gap;
   for (size_t i = 0; i < _parts.size() && i < NBUCKETS; ++i) {
-    CGFloat w = self.bounds.size.width * _parts[i] / total;
+    CGFloat w = b.size.width * _parts[i] / total;
+    if (w <= 0) continue;
     [kBucketColors[i] setFill];
-    NSRectFill(NSMakeRect(x, 0, w, self.bounds.size.height));
+    NSRectFill(NSMakeRect(x, 0, std::max<CGFloat>(0, w - gap), b.size.height));
     x += w;
   }
+}
+@end
+
+// DaisyDisk-style two-level ring: inner ring = folders of the root, outer ring = their folders.
+struct RingSeg {
+  int32_t dirId;      // -1 for "files here" / "everything else"
+  double a0, a1;      // fraction of a full turn, clockwise from 12 o'clock
+  int level;          // 0 inner, 1 outer
+  int hue;            // palette index, -1 = neutral
+  int shade;          // outer ring: alternates to separate neighbours
+  NSString* name;
+  NSString* detail;
+};
+
+@interface RingView : NSView
+@property(nonatomic) std::vector<RingSeg> segs;
+@property(nonatomic, copy) NSString* centerTitle;
+@property(nonatomic, copy) NSString* centerSub;
+@property(nonatomic, strong) NSColor* gapColor;
+@property(nonatomic, weak) id target;
+@property(nonatomic) SEL action;
+@property(nonatomic, readonly) int32_t clickedDir;
+@end
+@implementation RingView {
+  int _hover;
+  NSTrackingArea* _track;
+}
+- (instancetype)initWithFrame:(NSRect)f {
+  if (!(self = [super initWithFrame:f])) return nil;
+  _hover = -1;
+  _clickedDir = -1;
+  _gapColor = surfaceFill();
+  return self;
+}
+- (void)setSegs:(std::vector<RingSeg>)s {
+  _segs = std::move(s);
+  _hover = -1;
+  [self setNeedsDisplay:YES];
+}
+- (void)updateTrackingAreas {
+  [super updateTrackingAreas];
+  if (_track) [self removeTrackingArea:_track];
+  _track = [[NSTrackingArea alloc] initWithRect:self.bounds
+                                        options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited |
+                                                NSTrackingActiveInKeyWindow
+                                          owner:self
+                                       userInfo:nil];
+  [self addTrackingArea:_track];
+}
+- (void)radiiFor:(int)level inner:(CGFloat*)r0 outer:(CGFloat*)r1 {
+  CGFloat R = std::min(self.bounds.size.width, self.bounds.size.height) / 2 - 6;
+  if (level == 0) { *r0 = R * 0.50; *r1 = R * 0.76; }
+  else { *r0 = R * 0.80; *r1 = R; }
+}
+- (int)segmentAt:(NSPoint)p {
+  NSPoint c = NSMakePoint(NSMidX(self.bounds), NSMidY(self.bounds));
+  CGFloat dx = p.x - c.x, dy = p.y - c.y;
+  CGFloat d = std::hypot(dx, dy);
+  double ang = std::atan2(dy, dx) * 180 / M_PI;  // counter-clockwise from 3 o'clock
+  double frac = std::fmod(90 - ang + 720, 360) / 360;  // clockwise from 12 o'clock
+  for (size_t i = 0; i < _segs.size(); ++i) {
+    CGFloat r0, r1;
+    [self radiiFor:_segs[i].level inner:&r0 outer:&r1];
+    if (d >= r0 && d <= r1 + 3 && frac >= _segs[i].a0 && frac < _segs[i].a1) return (int)i;
+  }
+  return -1;
+}
+- (void)mouseMoved:(NSEvent*)e {
+  int h = [self segmentAt:[self convertPoint:e.locationInWindow fromView:nil]];
+  if (h != _hover) { _hover = h; [self setNeedsDisplay:YES]; }
+}
+- (void)mouseExited:(NSEvent*)e { if (_hover != -1) { _hover = -1; [self setNeedsDisplay:YES]; } }
+- (void)mouseDown:(NSEvent*)e {}
+- (void)mouseUp:(NSEvent*)e {
+  int h = [self segmentAt:[self convertPoint:e.locationInWindow fromView:nil]];
+  if (h < 0 || _segs[(size_t)h].dirId < 0 || !_target || !_action) return;
+  _clickedDir = _segs[(size_t)h].dirId;
+  [NSApp sendAction:_action to:_target from:self];
+}
+- (void)resetCursorRects {
+  for (const RingSeg& s : _segs)
+    if (s.dirId >= 0) { [self addCursorRect:self.bounds cursor:NSCursor.pointingHandCursor]; break; }
+}
+- (NSColor*)colorFor:(const RingSeg&)s {
+  NSColor* c = s.hue < 0 ? kRingOther : kRingColors[s.hue % kRingPalette];
+  if (s.level == 1) c = [c blendedColorWithFraction:(s.shade ? 0.28 : 0.10) ofColor:NSColor.whiteColor] ?: c;
+  if (s.dirId < 0 && s.level == 1) c = [c colorWithAlphaComponent:0.45];
+  return c;
+}
+- (void)drawRect:(NSRect)rect {
+  NSPoint c = NSMakePoint(NSMidX(self.bounds), NSMidY(self.bounds));
+  const RingSeg* hov = _hover >= 0 && (size_t)_hover < _segs.size() ? &_segs[(size_t)_hover] : nullptr;
+  for (size_t i = 0; i < _segs.size(); ++i) {
+    const RingSeg& s = _segs[i];
+    if (s.a1 - s.a0 <= 0) continue;
+    CGFloat r0, r1;
+    [self radiiFor:s.level inner:&r0 outer:&r1];
+    BOOL isHover = hov == &s;
+    // Highlight the hovered segment and, for an inner one, its outer children.
+    BOOL related = hov && !isHover && hov->level == 0 && s.level == 1 && s.a0 >= hov->a0 - 1e-9 && s.a1 <= hov->a1 + 1e-9;
+    if (isHover) r1 += 3;
+    CGFloat start = 90 - s.a0 * 360, end = 90 - s.a1 * 360;
+    NSBezierPath* p = [NSBezierPath bezierPath];
+    [p appendBezierPathWithArcWithCenter:c radius:r1 startAngle:start endAngle:end clockwise:YES];
+    [p appendBezierPathWithArcWithCenter:c radius:r0 startAngle:end endAngle:start clockwise:NO];
+    [p closePath];
+    NSColor* col = [self colorFor:s];
+    if (hov && !isHover && !related) col = [col colorWithAlphaComponent:0.35];
+    [col setFill];
+    [p fill];
+    [_gapColor setStroke];
+    p.lineWidth = 1.5;
+    [p stroke];
+  }
+  // Centre text.
+  NSString* title = hov ? hov->name : _centerTitle;
+  NSString* sub = hov ? hov->detail : _centerSub;
+  CGFloat r0, r1;
+  [self radiiFor:0 inner:&r0 outer:&r1];
+  CGFloat maxW = r0 * 2 - 12;
+  NSMutableParagraphStyle* ps = [NSMutableParagraphStyle new];
+  ps.alignment = NSTextAlignmentCenter;
+  ps.lineBreakMode = NSLineBreakByTruncatingTail;
+  // Shrink the headline until it fits the hole (folder names may still truncate).
+  NSFont* tf = hov ? [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] : roundedFont(24, NSFontWeightBold);
+  if (!hov) {
+    for (CGFloat sz = 24; sz >= 13; sz -= 1) {
+      tf = roundedFont(sz, NSFontWeightBold);
+      if ([title ?: @"" sizeWithAttributes:@{NSFontAttributeName : tf}].width <= maxW) break;
+    }
+  }
+  NSDictionary* ta = @{
+    NSFontAttributeName : tf,
+    NSForegroundColorAttributeName : NSColor.labelColor,
+    NSParagraphStyleAttributeName : ps
+  };
+  NSDictionary* sa = @{
+    NSFontAttributeName : monoDigits(11, NSFontWeightMedium),
+    NSForegroundColorAttributeName : NSColor.secondaryLabelColor,
+    NSParagraphStyleAttributeName : ps
+  };
+  NSAttributedString* t = [[NSAttributedString alloc] initWithString:title ?: @"" attributes:ta];
+  NSAttributedString* u = [[NSAttributedString alloc] initWithString:sub ?: @"" attributes:sa];
+  NSRect tb = [t boundingRectWithSize:NSMakeSize(maxW, 60) options:NSStringDrawingUsesLineFragmentOrigin];
+  NSRect ub = [u boundingRectWithSize:NSMakeSize(maxW, 40) options:NSStringDrawingUsesLineFragmentOrigin];
+  ub.size.height = std::min<CGFloat>(ub.size.height, 30);
+  CGFloat total = tb.size.height + 2 + ub.size.height;
+  CGFloat y = c.y + total / 2;
+  [t drawWithRect:NSMakeRect(c.x - maxW / 2, y - tb.size.height, maxW, tb.size.height) options:NSStringDrawingUsesLineFragmentOrigin];
+  [u drawWithRect:NSMakeRect(c.x - maxW / 2, y - tb.size.height - 2 - ub.size.height, maxW, ub.size.height)
+          options:NSStringDrawingUsesLineFragmentOrigin];
 }
 @end
 
@@ -212,6 +557,12 @@ static const ModeInfo kModes[] = {
 - (BOOL)isFlipped { return YES; }
 @end
 
+@interface HairlineView : NSView
+@end
+@implementation HairlineView
+- (void)drawRect:(NSRect)r { [NSColor.separatorColor setFill]; NSRectFill(self.bounds); }
+@end
+
 // Size cell: text on top of a faint bar proportional to the item's share of its parent.
 @interface SizeCellView : NSTableCellView
 @property(nonatomic) double fraction;
@@ -220,17 +571,17 @@ static const ModeInfo kModes[] = {
 - (void)drawRect:(NSRect)r {
   [super drawRect:r];
   if (_fraction <= 0) return;
-  NSRect b = NSInsetRect(self.bounds, 4, 5);
-  CGFloat w = std::max<CGFloat>(2, b.size.width * std::min(1.0, _fraction));
+  NSRect b = NSInsetRect(self.bounds, 4, 6);
+  CGFloat w = std::max<CGFloat>(3, b.size.width * std::min(1.0, _fraction));
   NSRect bar = NSMakeRect(NSMaxX(b) - w, b.origin.y, w, b.size.height);
-  [[NSColor.controlAccentColor colorWithAlphaComponent:0.18] setFill];
-  [[NSBezierPath bezierPathWithRoundedRect:bar xRadius:3 yRadius:3] fill];
+  [[NSColor.controlAccentColor colorWithAlphaComponent:0.16] setFill];
+  [[NSBezierPath bezierPathWithRoundedRect:bar xRadius:4 yRadius:4] fill];
 }
 - (void)setFraction:(double)f { _fraction = f; [self setNeedsDisplay:YES]; }
 @end
 
-// Rounded, clickable card used on the Overview page.
-@interface CardView : NSView
+// Clickable summary card on the Overview page.
+@interface CardView : SurfaceView
 @property(nonatomic) Mode mode;
 @property(nonatomic, weak) id target;
 @property(nonatomic) SEL action;
@@ -239,17 +590,32 @@ static const ModeInfo kModes[] = {
 @property(nonatomic) BOOL hover;
 @end
 @implementation CardView
-- (instancetype)initWithMode:(Mode)m {
+- (instancetype)initWithMode:(Mode)m tint:(NSColor*)tint {
   if (!(self = [super initWithFrame:NSZeroRect])) return nil;
   _mode = m;
   const ModeInfo& mi = kModes[(int)m];
-  NSImageView* icon = [NSImageView imageViewWithImage:symbol(mi.symbol, 15, NSFontWeightMedium)];
-  icon.contentTintColor = NSColor.controlAccentColor;
-  NSTextField* title = label(mi.title, 13, NSFontWeightMedium, NSColor.labelColor);
-  NSStackView* top = [NSStackView stackViewWithViews:@[ icon, title ]];
-  top.spacing = 6;
-  _valueLabel = label(@"—", 24, NSFontWeightSemibold, NSColor.labelColor);
-  _valueLabel.font = [NSFont monospacedDigitSystemFontOfSize:24 weight:NSFontWeightSemibold];
+  NSView* badge = [NSView new];
+  badge.wantsLayer = YES;
+  badge.layer.cornerRadius = 8;
+  badge.layer.backgroundColor = [tint colorWithAlphaComponent:0.16].CGColor;
+  fixSize(badge, 28, 28);
+  NSImageView* icon = [NSImageView imageViewWithImage:symbol(mi.symbol, 13, NSFontWeightSemibold)];
+  icon.contentTintColor = tint;
+  icon.translatesAutoresizingMaskIntoConstraints = NO;
+  [badge addSubview:icon];
+  [NSLayoutConstraint activateConstraints:@[
+    [icon.centerXAnchor constraintEqualToAnchor:badge.centerXAnchor],
+    [icon.centerYAnchor constraintEqualToAnchor:badge.centerYAnchor],
+  ]];
+  NSTextField* title = label(mi.title, 12, NSFontWeightMedium, NSColor.secondaryLabelColor);
+  NSImageView* chevron = [NSImageView imageViewWithImage:symbol(@"chevron.right", 10, NSFontWeightSemibold)];
+  chevron.contentTintColor = NSColor.tertiaryLabelColor;
+  NSStackView* top = [NSStackView stackViewWithViews:@[ badge, title, chevron ]];
+  top.spacing = 8;
+  [top setCustomSpacing:0 afterView:title];
+  [title setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+  _valueLabel = label(@"—", 22, NSFontWeightSemibold, NSColor.labelColor);
+  _valueLabel.font = roundedFont(22, NSFontWeightSemibold);
   _detailLabel = [NSTextField wrappingLabelWithString:@""];
   _detailLabel.font = [NSFont systemFontOfSize:11];
   _detailLabel.textColor = NSColor.secondaryLabelColor;
@@ -258,16 +624,11 @@ static const ModeInfo kModes[] = {
   NSStackView* col = [NSStackView stackViewWithViews:@[ top, _valueLabel, _detailLabel ]];
   col.orientation = NSUserInterfaceLayoutOrientationVertical;
   col.alignment = NSLayoutAttributeLeading;
-  col.spacing = 4;
-  [col setCustomSpacing:10 afterView:top];
-  col.translatesAutoresizingMaskIntoConstraints = NO;
-  [self addSubview:col];
-  [NSLayoutConstraint activateConstraints:@[
-    [col.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
-    [col.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-14],
-    [col.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
-    [col.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12],
-  ]];
+  col.spacing = 2;
+  [col setCustomSpacing:12 afterView:top];
+  pin(col, self, NSEdgeInsetsMake(14, 16, 14, 14));
+  [top.widthAnchor constraintEqualToAnchor:col.widthAnchor].active = YES;
+  [_detailLabel.widthAnchor constraintEqualToAnchor:col.widthAnchor].active = YES;
   [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
                                                      options:NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow |
                                                              NSTrackingInVisibleRect
@@ -277,16 +638,13 @@ static const ModeInfo kModes[] = {
   return self;
 }
 - (void)drawRect:(NSRect)r {
-  NSBezierPath* p = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds, 0.5, 0.5) xRadius:10 yRadius:10];
-  [NSColor.controlBackgroundColor setFill];
-  [p fill];
+  self.stroke = _hover ? [NSColor.controlAccentColor colorWithAlphaComponent:0.7] : surfaceStroke();
+  [super drawRect:r];
   if (_hover) {
-    [[NSColor.controlAccentColor colorWithAlphaComponent:0.06] setFill];
+    NSBezierPath* p = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds, 0.5, 0.5) xRadius:self.radius yRadius:self.radius];
+    [[NSColor.controlAccentColor colorWithAlphaComponent:0.04] setFill];
     [p fill];
   }
-  [[NSColor.separatorColor colorWithAlphaComponent:_hover ? 0.9 : 0.5] setStroke];
-  p.lineWidth = 1;
-  [p stroke];
 }
 - (void)mouseEntered:(NSEvent*)e { _hover = YES; [self setNeedsDisplay:YES]; }
 - (void)mouseExited:(NSEvent*)e { _hover = NO; [self setNeedsDisplay:YES]; }
@@ -330,15 +688,23 @@ static const ModeInfo kModes[] = {
   NSTextField* _pageTitle;
   NSTextField* _pageHint;
 
+  // index status pill (top right of every page)
+  SurfaceView* _statusPill;
+  NSImageView* _statusIcon;
+  NSProgressIndicator* _statusSpinner;
+  NSTextField* _statusText;
+  NSButton* _statusStop;
+
   // overview page
   NSScrollView* _overviewScroll;
-  NSTextField* _bigNumber;
-  NSTextField* _bigSub;
-  UsageBarView* _bar;
+  RingView* _ring;
+  NSTextField* _heroCaption;
+  RecencyBarView* _bar;
   NSStackView* _legend;
   NSMutableArray<CardView*>* _cards;
   NSStackView* _topList;
   NSTextField* _topTitle;
+  SurfaceView* _topSurface;
 
   // list page
   NSView* _listBox;
@@ -353,11 +719,11 @@ static const ModeInfo kModes[] = {
   NSButton* _trashButton;
   NSButton* _revealButton;
 
-  // scanning
-  NSView* _overlay;
-  NSTextField* _overlayText;
-  NSTextField* _overlayCount;
-  NSProgressIndicator* _spinner;
+  // first index of a root: full-page progress
+  NSView* _firstRun;
+  NSTextField* _firstRunTitle;
+  NSTextField* _firstRunCount;
+  NSProgressIndicator* _firstRunSpinner;
   NSTimer* _progressTimer;
 
   Model _model;
@@ -365,14 +731,17 @@ static const ModeInfo kModes[] = {
   NSArray<Item*>* _flat;  // items shown in non-browse modes
   NSMutableArray<Item*>* _appItems;
   Mode _mode;
-  std::string _scanPath;    // folder being (or last asked to be) scanned
-  std::string _resultPath;  // folder the current model describes
+  std::string _scanPath;    // root being (or last asked to be) indexed
+  std::string _resultPath;  // root the current model describes
   std::shared_ptr<std::atomic<uint64_t>> _progress;
   std::shared_ptr<std::atomic<bool>> _cancel;  // owned by the scan in flight
   int _scanGeneration;
   BOOL _scanning;
+  BOOL _loading;  // reading the index from disk
+  NSTimer* _persistTimer;
   NSString* _sortKey;
   BOOL _sortAscending;
+  std::string _launchRoot;  // folder handed over by Finder/`open` before the window exists
 }
 
 // ───── app lifecycle ─────
@@ -384,24 +753,48 @@ static const ModeInfo kModes[] = {
   _mode = Mode::Overview;
   [self buildMenus];
   [self buildWindow];
+  [self installEscapeMonitor];
   [NSApp activateIgnoringOtherApps:YES];
-  std::string start = std_str(NSHomeDirectory());
+  std::string start = _launchRoot.empty() ? "/" : _launchRoot;
   NSArray<NSString*>* args = NSProcessInfo.processInfo.arguments;
   if (args.count > 1 && ![args[1] hasPrefix:@"-"]) {
     BOOL isDir = NO;
     if ([NSFileManager.defaultManager fileExistsAtPath:args[1] isDirectory:&isDir] && isDir)
       start = std_str(args[1].stringByStandardizingPath);
   }
-  [self scanPath:start];
+  [self openRoot:start];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)a { return YES; }
 
+- (void)applicationWillTerminate:(NSNotification*)n {
+  if (_persistTimer) {
+    [_persistTimer invalidate];
+    _persistTimer = nil;
+    [self persistIndexNow];
+  }
+}
+
 - (BOOL)application:(NSApplication*)app openFile:(NSString*)path {
   BOOL isDir = NO;
   if (![NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&isDir] || !isDir) return NO;
-  [self scanPath:std_str(path.stringByStandardizingPath)];
+  std::string root = std_str(path.stringByStandardizingPath);
+  if (_window) [self openRoot:root];
+  else _launchRoot = root;  // cold launch: this arrives before applicationDidFinishLaunching
   return YES;
+}
+
+// Escape stops an in-flight scan unless a text field owns the key (it uses Escape itself).
+- (void)installEscapeMonitor {
+  __weak StaleController* weakSelf = self;
+  [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                        handler:^NSEvent*(NSEvent* e) {
+    StaleController* s = weakSelf;
+    if (!s || e.keyCode != 53 || !s->_scanning || e.window != s->_window) return e;
+    if ([s->_window.firstResponder isKindOfClass:NSText.class]) return e;
+    [s cancelScan:nil];
+    return nil;
+  }];
 }
 
 - (void)buildMenus {
@@ -422,10 +815,12 @@ static const ModeInfo kModes[] = {
   NSMenuItem* fileItem = [NSMenuItem new];
   [menubar addItem:fileItem];
   NSMenu* file = [[NSMenu alloc] initWithTitle:@"File"];
-  [file addItemWithTitle:@"Scan Folder…" action:@selector(chooseFolder:) keyEquivalent:@"o"];
-  [file addItemWithTitle:@"Scan Home Folder" action:@selector(scanHome:) keyEquivalent:@"H"];
+  [file addItemWithTitle:@"Open Folder…" action:@selector(chooseFolder:) keyEquivalent:@"o"];
+  [file addItemWithTitle:@"Whole Disk" action:@selector(openDisk:) keyEquivalent:@"D"];
+  [file addItemWithTitle:@"Home Folder" action:@selector(openHome:) keyEquivalent:@"H"];
+  [file addItem:NSMenuItem.separatorItem];
   [file addItemWithTitle:@"Rescan" action:@selector(rescan:) keyEquivalent:@"r"];
-  [file addItemWithTitle:@"Stop Scan" action:@selector(cancelScan:) keyEquivalent:@"."];
+  [file addItemWithTitle:@"Stop Indexing" action:@selector(cancelScan:) keyEquivalent:@"."];
   [file addItem:NSMenuItem.separatorItem];
   [file addItemWithTitle:@"Reveal in Finder" action:@selector(revealSelected:) keyEquivalent:@"R"];
   NSMenuItem* trash = [file addItemWithTitle:@"Move to Trash" action:@selector(trashSelected:) keyEquivalent:@"\b"];
@@ -467,6 +862,8 @@ static const ModeInfo kModes[] = {
   NSMenu* help = [[NSMenu alloc] initWithTitle:@"Help"];
   [help addItemWithTitle:@"Stale on GitHub" action:@selector(openGitHub:) keyEquivalent:@""];
   [help addItemWithTitle:@"Grant Full Disk Access…" action:@selector(openFDA:) keyEquivalent:@""];
+  [help addItem:NSMenuItem.separatorItem];
+  [help addItemWithTitle:@"Show Index Files in Finder" action:@selector(revealIndex:) keyEquivalent:@""];
   helpItem.submenu = help;
   NSApp.helpMenu = help;
 
@@ -475,13 +872,13 @@ static const ModeInfo kModes[] = {
 
 - (void)buildWindow {
   _window = [[NSWindow alloc]
-      initWithContentRect:NSMakeRect(0, 0, 1140, 760)
+      initWithContentRect:NSMakeRect(0, 0, 1180, 780)
                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
                           NSWindowStyleMaskResizable | NSWindowStyleMaskFullSizeContentView
                   backing:NSBackingStoreBuffered
                     defer:NO];
   _window.title = @"Stale";
-  _window.minSize = NSMakeSize(820, 520);
+  _window.minSize = NSMakeSize(860, 560);
   _window.toolbarStyle = NSWindowToolbarStyleUnified;
   _window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleAutomatic;
   NSToolbar* tb = [[NSToolbar alloc] initWithIdentifier:@"main"];
@@ -503,11 +900,11 @@ static const ModeInfo kModes[] = {
   NSViewController* contentVC = [NSViewController new];
   contentVC.view = [self buildContent];
   NSSplitViewItem* main = [NSSplitViewItem splitViewItemWithViewController:contentVC];
-  main.minimumThickness = 600;
+  main.minimumThickness = 640;
   [_split addSplitViewItem:main];
 
   _window.contentViewController = _split;
-  [_window setContentSize:NSMakeSize(1140, 760)];
+  [_window setContentSize:NSMakeSize(1180, 780)];
   [_window center];
   [_window setFrameAutosaveName:@"StaleMain"];
   [_window makeKeyAndOrderFront:nil];
@@ -554,14 +951,7 @@ static const ModeInfo kModes[] = {
   sc.automaticallyAdjustsContentInsets = YES;
 
   NSView* v = [NSView new];
-  sc.translatesAutoresizingMaskIntoConstraints = NO;
-  [v addSubview:sc];
-  [NSLayoutConstraint activateConstraints:@[
-    [sc.leadingAnchor constraintEqualToAnchor:v.leadingAnchor],
-    [sc.trailingAnchor constraintEqualToAnchor:v.trailingAnchor],
-    [sc.topAnchor constraintEqualToAnchor:v.topAnchor],
-    [sc.bottomAnchor constraintEqualToAnchor:v.bottomAnchor],
-  ]];
+  pin(sc, v, NSEdgeInsetsMake(0, 0, 0, 0));
   return v;
 }
 
@@ -571,7 +961,16 @@ static const ModeInfo kModes[] = {
   _fdaBanner = [self makeBanner];
   _fdaBanner.hidden = YES;
 
-  _pageTitle = label(@"Overview", 22, NSFontWeightBold, NSColor.labelColor);
+  _pageTitle = label(@"Overview", 26, NSFontWeightBold, NSColor.labelColor);
+  _pageTitle.font = roundedFont(26, NSFontWeightBold);
+  [self buildStatusPill];
+  NSView* titleSpacer = [[NSView alloc] initWithFrame:NSZeroRect];
+  [titleSpacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+  NSStackView* titleRow = [NSStackView stackViewWithViews:@[ _pageTitle, _statusPill, titleSpacer ]];
+  titleRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+  titleRow.alignment = NSLayoutAttributeCenterY;
+  titleRow.spacing = 12;
+
   _pageHint = [NSTextField wrappingLabelWithString:@""];
   _pageHint.font = [NSFont systemFontOfSize:12];
   _pageHint.textColor = NSColor.secondaryLabelColor;
@@ -579,114 +978,136 @@ static const ModeInfo kModes[] = {
 
   [self buildOverview];
   [self buildList];
+  [self buildFirstRun];
 
-  NSStackView* page = [NSStackView stackViewWithViews:@[ _fdaBanner, _pageTitle, _pageHint, _overviewScroll, _listBox, _bottom ]];
+  NSStackView* page = [NSStackView
+      stackViewWithViews:@[ _fdaBanner, titleRow, _pageHint, _overviewScroll, _listBox, _firstRun, _bottom ]];
   page.orientation = NSUserInterfaceLayoutOrientationVertical;
   page.alignment = NSLayoutAttributeLeading;
-  page.spacing = 6;
-  [page setCustomSpacing:14 afterView:_fdaBanner];
-  [page setCustomSpacing:14 afterView:_pageHint];
-  [page setCustomSpacing:10 afterView:_listBox];
+  page.spacing = 8;
+  [page setCustomSpacing:16 afterView:_fdaBanner];
+  [page setCustomSpacing:4 afterView:titleRow];
+  [page setCustomSpacing:16 afterView:_pageHint];
+  [page setCustomSpacing:12 afterView:_listBox];
   page.translatesAutoresizingMaskIntoConstraints = NO;
   [_content addSubview:page];
   [NSLayoutConstraint activateConstraints:@[
     [page.leadingAnchor constraintEqualToAnchor:_content.leadingAnchor constant:24],
     [page.trailingAnchor constraintEqualToAnchor:_content.trailingAnchor constant:-24],
-    [page.topAnchor constraintEqualToAnchor:_content.safeAreaLayoutGuide.topAnchor constant:18],
-    [page.bottomAnchor constraintEqualToAnchor:_content.bottomAnchor constant:-14],
+    [page.topAnchor constraintEqualToAnchor:_content.safeAreaLayoutGuide.topAnchor constant:16],
+    [page.bottomAnchor constraintEqualToAnchor:_content.bottomAnchor constant:-16],
     [_fdaBanner.widthAnchor constraintEqualToAnchor:page.widthAnchor],
+    [titleRow.widthAnchor constraintEqualToAnchor:page.widthAnchor],
     [_pageHint.widthAnchor constraintEqualToAnchor:page.widthAnchor],
     [_overviewScroll.widthAnchor constraintEqualToAnchor:page.widthAnchor],
     [_listBox.widthAnchor constraintEqualToAnchor:page.widthAnchor],
+    [_firstRun.widthAnchor constraintEqualToAnchor:page.widthAnchor],
     [_bottom.widthAnchor constraintEqualToAnchor:page.widthAnchor],
   ]];
-  [_listBox setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationVertical];
-  [_overviewScroll setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationVertical];
-
-  // ── scanning overlay
-  _overlay = [NSVisualEffectView new];
-  ((NSVisualEffectView*)_overlay).material = NSVisualEffectMaterialWindowBackground;
-  ((NSVisualEffectView*)_overlay).blendingMode = NSVisualEffectBlendingModeWithinWindow;
-  _spinner = [NSProgressIndicator new];
-  _spinner.style = NSProgressIndicatorStyleSpinning;
-  _spinner.controlSize = NSControlSizeRegular;
-  _overlayText = label(@"Scanning…", 15, NSFontWeightSemibold, NSColor.labelColor);
-  _overlayText.alignment = NSTextAlignmentCenter;
-  _overlayText.lineBreakMode = NSLineBreakByTruncatingMiddle;
-  _overlayCount = label(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
-  _overlayCount.alignment = NSTextAlignmentCenter;
-  _overlayCount.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
-  NSButton* stop = [NSButton buttonWithTitle:@"Stop" target:self action:@selector(cancelScan:)];
-  stop.controlSize = NSControlSizeSmall;
-  stop.font = [NSFont systemFontOfSize:11];
-  NSStackView* ov = [NSStackView stackViewWithViews:@[ _spinner, _overlayText, _overlayCount, stop ]];
-  ov.orientation = NSUserInterfaceLayoutOrientationVertical;
-  ov.spacing = 8;
-  [ov setCustomSpacing:14 afterView:_spinner];
-  [ov setCustomSpacing:16 afterView:_overlayCount];
-  ov.translatesAutoresizingMaskIntoConstraints = NO;
-  [_overlay addSubview:ov];
-  _overlay.translatesAutoresizingMaskIntoConstraints = NO;
-  [_content addSubview:_overlay];
-  [NSLayoutConstraint activateConstraints:@[
-    [_overlay.leadingAnchor constraintEqualToAnchor:_content.leadingAnchor],
-    [_overlay.trailingAnchor constraintEqualToAnchor:_content.trailingAnchor],
-    [_overlay.topAnchor constraintEqualToAnchor:_content.topAnchor],
-    [_overlay.bottomAnchor constraintEqualToAnchor:_content.bottomAnchor],
-    [ov.centerXAnchor constraintEqualToAnchor:_overlay.centerXAnchor],
-    [ov.centerYAnchor constraintEqualToAnchor:_overlay.centerYAnchor constant:-20],
-    [_overlayText.widthAnchor constraintLessThanOrEqualToConstant:520],
-  ]];
-  _overlay.hidden = YES;
+  for (NSView* v in @[ _listBox, _overviewScroll, _firstRun ])
+    [v setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationVertical];
   return _content;
 }
 
+- (void)buildStatusPill {
+  _statusPill = [[SurfaceView alloc] initWithFrame:NSZeroRect];
+  _statusPill.radius = 13;
+  _statusIcon = [NSImageView imageViewWithImage:symbol(@"clock", 11, NSFontWeightSemibold)];
+  _statusIcon.contentTintColor = NSColor.secondaryLabelColor;
+  _statusSpinner = [NSProgressIndicator new];
+  _statusSpinner.style = NSProgressIndicatorStyleSpinning;
+  _statusSpinner.controlSize = NSControlSizeSmall;
+  _statusSpinner.displayedWhenStopped = NO;
+  fixSize(_statusSpinner, 14, 14);
+  _statusText = label(@"", 12, NSFontWeightMedium, NSColor.secondaryLabelColor);
+  _statusText.font = monoDigits(12, NSFontWeightMedium);
+  _statusStop = [NSButton buttonWithTitle:@"Stop" target:self action:@selector(cancelScan:)];
+  _statusStop.bezelStyle = NSBezelStyleInline;
+  _statusStop.controlSize = NSControlSizeSmall;
+  _statusStop.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+  NSStackView* row = [NSStackView stackViewWithViews:@[ _statusIcon, _statusSpinner, _statusText, _statusStop ]];
+  row.spacing = 6;
+  row.alignment = NSLayoutAttributeCenterY;
+  [row setHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+  pin(row, _statusPill, NSEdgeInsetsMake(4, 10, 4, 8));
+  [_statusPill.heightAnchor constraintEqualToConstant:26].active = YES;
+  _statusPill.hidden = YES;
+}
+
 - (void)buildOverview {
-  _bigNumber = label(@"—", 40, NSFontWeightBold, NSColor.labelColor);
-  _bigNumber.font = [NSFont monospacedDigitSystemFontOfSize:40 weight:NSFontWeightBold];
-  _bigSub = label(@"", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
-  _bigSub.lineBreakMode = NSLineBreakByTruncatingMiddle;
+  // ── hero: ring + recency
+  SurfaceView* hero = [[SurfaceView alloc] initWithFrame:NSZeroRect];
+  _ring = [[RingView alloc] initWithFrame:NSZeroRect];
+  _ring.target = self;
+  _ring.action = @selector(ringClicked:);
+  fixSize(_ring, 240, 240);
 
-  _bar = [UsageBarView new];
-  [_bar.heightAnchor constraintEqualToConstant:18].active = YES;
-
+  _heroCaption = label(@"BY LAST USE", 11, NSFontWeightSemibold, NSColor.tertiaryLabelColor);
+  _bar = [RecencyBarView new];
+  _bar.gap = 2;
+  fixSize(_bar, 0, 14);
   _legend = [NSStackView new];
-  _legend.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-  _legend.distribution = NSStackViewDistributionFillEqually;
-  _legend.alignment = NSLayoutAttributeTop;
-  _legend.spacing = 12;
+  _legend.orientation = NSUserInterfaceLayoutOrientationVertical;
+  _legend.alignment = NSLayoutAttributeLeading;
+  _legend.spacing = 6;
+  NSTextField* heroNote = [NSTextField wrappingLabelWithString:
+      @"Recency comes from Spotlight's “last opened” dates where available, otherwise from when a file was last changed."];
+  heroNote.font = [NSFont systemFontOfSize:11];
+  heroNote.textColor = NSColor.tertiaryLabelColor;
+  heroNote.selectable = NO;
+  NSStackView* right = [NSStackView stackViewWithViews:@[ _heroCaption, _bar, _legend, heroNote ]];
+  right.orientation = NSUserInterfaceLayoutOrientationVertical;
+  right.alignment = NSLayoutAttributeLeading;
+  right.spacing = 12;
+  [right setCustomSpacing:14 afterView:_bar];
+  [right setCustomSpacing:16 afterView:_legend];
+  NSStackView* heroRow = [NSStackView stackViewWithViews:@[ _ring, right ]];
+  heroRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+  heroRow.alignment = NSLayoutAttributeCenterY;
+  heroRow.spacing = 28;
+  pin(heroRow, hero, NSEdgeInsetsMake(20, 24, 20, 24));
+  [NSLayoutConstraint activateConstraints:@[
+    [_bar.widthAnchor constraintEqualToAnchor:right.widthAnchor],
+    [_legend.widthAnchor constraintEqualToAnchor:right.widthAnchor],
+    [heroNote.widthAnchor constraintEqualToAnchor:right.widthAnchor],
+  ]];
+  [right setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-  NSTextField* cardsTitle = label(@"Where to look", 13, NSFontWeightSemibold, NSColor.secondaryLabelColor);
+  // ── cards
   _cards = [NSMutableArray new];
   NSStackView* cardRow = [NSStackView new];
   cardRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
   cardRow.distribution = NSStackViewDistributionFillEqually;
   cardRow.alignment = NSLayoutAttributeHeight;
   cardRow.spacing = 12;
-  for (Mode m : {Mode::Reclaim, Mode::Forgotten, Mode::BigFiles, Mode::Apps}) {
-    CardView* c = [[CardView alloc] initWithMode:m];
+  struct CardDef { Mode m; NSColor* tint; };
+  CardDef defs[] = {{Mode::Reclaim, kBucketColors[HOT]},
+                    {Mode::Forgotten, kBucketColors[STALE]},
+                    {Mode::BigFiles, kBucketColors[COLD]},
+                    {Mode::Apps, kRingColors[9]}};
+  for (const CardDef& d : defs) {
+    CardView* c = [[CardView alloc] initWithMode:d.m tint:d.tint];
     c.target = self;
     c.action = @selector(cardClicked:);
     [_cards addObject:c];
     [cardRow addView:c inGravity:NSStackViewGravityLeading];
   }
 
-  _topTitle = label(@"Biggest folders", 13, NSFontWeightSemibold, NSColor.secondaryLabelColor);
+  // ── biggest folders
+  _topTitle = label(@"BIGGEST FOLDERS", 11, NSFontWeightSemibold, NSColor.tertiaryLabelColor);
   _topList = [NSStackView new];
   _topList.orientation = NSUserInterfaceLayoutOrientationVertical;
   _topList.alignment = NSLayoutAttributeLeading;
   _topList.spacing = 0;
+  _topSurface = [[SurfaceView alloc] initWithFrame:NSZeroRect];
+  pin(_topList, _topSurface, NSEdgeInsetsMake(6, 8, 6, 8));
 
-  NSStackView* stack = [NSStackView
-      stackViewWithViews:@[ _bigNumber, _bigSub, _bar, _legend, cardsTitle, cardRow, _topTitle, _topList ]];
+  NSStackView* stack = [NSStackView stackViewWithViews:@[ hero, cardRow, _topTitle, _topSurface ]];
   stack.orientation = NSUserInterfaceLayoutOrientationVertical;
   stack.alignment = NSLayoutAttributeLeading;
-  stack.spacing = 8;
-  [stack setCustomSpacing:2 afterView:_bigNumber];
-  [stack setCustomSpacing:18 afterView:_bigSub];
-  [stack setCustomSpacing:10 afterView:_bar];
-  [stack setCustomSpacing:28 afterView:_legend];
-  [stack setCustomSpacing:28 afterView:cardRow];
+  stack.spacing = 16;
+  [stack setCustomSpacing:24 afterView:cardRow];
+  [stack setCustomSpacing:8 afterView:_topTitle];
   stack.edgeInsets = NSEdgeInsetsMake(2, 0, 20, 0);
 
   _overviewScroll = [NSScrollView new];
@@ -707,11 +1128,9 @@ static const ModeInfo kModes[] = {
     [stack.trailingAnchor constraintEqualToAnchor:doc.trailingAnchor],
     [stack.topAnchor constraintEqualToAnchor:doc.topAnchor],
     [stack.bottomAnchor constraintEqualToAnchor:doc.bottomAnchor],
-    [_bar.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
-    [_legend.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
+    [hero.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
     [cardRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
-    [_topList.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
-    [_bigSub.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
+    [_topSurface.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
   ]];
 }
 
@@ -720,21 +1139,23 @@ static const ModeInfo kModes[] = {
   _outline.dataSource = self;
   _outline.delegate = self;
   _outline.allowsMultipleSelection = YES;
-  _outline.usesAlternatingRowBackgroundColors = YES;
-  _outline.rowHeight = 24;
-  _outline.style = NSTableViewStyleFullWidth;
+  _outline.usesAlternatingRowBackgroundColors = NO;
+  _outline.gridStyleMask = NSTableViewSolidHorizontalGridLineMask;
+  _outline.gridColor = [NSColor.separatorColor colorWithAlphaComponent:0.35];
+  _outline.rowHeight = 28;
+  _outline.style = NSTableViewStyleInset;
   _outline.autoresizesOutlineColumn = YES;
   _outline.columnAutoresizingStyle = NSTableViewUniformColumnAutoresizingStyle;
   _outline.doubleAction = @selector(doubleClicked:);
   _outline.target = self;
   _outline.autosaveTableColumns = YES;
-  _outline.autosaveName = @"StaleColumns";
+  _outline.autosaveName = @"StaleColumns2";
   _outline.menu = [self makeContextMenu];
 
   struct Col { NSString* id; NSString* title; CGFloat w; CGFloat minW; NSString* sortKey; };
   Col cols[] = {{@"name", @"Name", 320, 180, @"name"},
-                {@"size", @"Size", 100, 80, @"size"},
-                {@"used", @"Last used", 150, 120, @"lastUsed"},
+                {@"size", @"Size", 110, 90, @"size"},
+                {@"used", @"Last used", 160, 130, @"lastUsed"},
                 {@"note", @"What is it", 260, 120, nil}};
   for (const Col& c : cols) {
     NSTableColumn* col = [[NSTableColumn alloc] initWithIdentifier:c.id];
@@ -754,6 +1175,9 @@ static const ModeInfo kModes[] = {
   _scroll.documentView = _outline;
   _scroll.hasVerticalScroller = YES;
   _scroll.borderType = NSNoBorder;
+  _scroll.wantsLayer = YES;
+  _scroll.layer.cornerRadius = 10;
+  _scroll.layer.masksToBounds = YES;
 
   _emptyIcon = [NSImageView imageViewWithImage:symbol(@"checkmark.circle", 40, NSFontWeightLight)];
   _emptyIcon.contentTintColor = NSColor.tertiaryLabelColor;
@@ -779,16 +1203,7 @@ static const ModeInfo kModes[] = {
   _empty.hidden = YES;
 
   _listBox = [NSView new];
-  for (NSView* v in @[ _scroll, _empty ]) {
-    v.translatesAutoresizingMaskIntoConstraints = NO;
-    [_listBox addSubview:v];
-    [NSLayoutConstraint activateConstraints:@[
-      [v.leadingAnchor constraintEqualToAnchor:_listBox.leadingAnchor],
-      [v.trailingAnchor constraintEqualToAnchor:_listBox.trailingAnchor],
-      [v.topAnchor constraintEqualToAnchor:_listBox.topAnchor],
-      [v.bottomAnchor constraintEqualToAnchor:_listBox.bottomAnchor],
-    ]];
-  }
+  for (NSView* v in @[ _scroll, _empty ]) pin(v, _listBox, NSEdgeInsetsMake(0, 0, 0, 0));
 
   // ── bottom bar
   _status = label(@"Select folders or files to move them to the Trash.", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
@@ -796,6 +1211,7 @@ static const ModeInfo kModes[] = {
   _revealButton = [NSButton buttonWithTitle:@"Reveal in Finder" target:self action:@selector(revealSelected:)];
   _trashButton = [NSButton buttonWithTitle:@"Move to Trash…" target:self action:@selector(trashSelected:)];
   _trashButton.keyEquivalent = @"";
+  _trashButton.bezelColor = NSColor.controlAccentColor;
   _revealButton.enabled = _trashButton.enabled = NO;
   NSStackView* bottom = [NSStackView stackViewWithViews:@[ _status, _revealButton, _trashButton ]];
   bottom.orientation = NSUserInterfaceLayoutOrientationHorizontal;
@@ -806,11 +1222,54 @@ static const ModeInfo kModes[] = {
   _bottom = bottom;
 }
 
+- (void)buildFirstRun {
+  NSImageView* icon = [NSImageView imageViewWithImage:symbol(@"internaldrive.fill", 44, NSFontWeightRegular)];
+  icon.contentTintColor = NSColor.controlAccentColor;
+  _firstRunTitle = label(@"Indexing your Mac", 20, NSFontWeightSemibold, NSColor.labelColor);
+  _firstRunTitle.alignment = NSTextAlignmentCenter;
+  _firstRunTitle.font = roundedFont(20, NSFontWeightSemibold);
+  _firstRunCount = label(@"", 13, NSFontWeightMedium, NSColor.secondaryLabelColor);
+  _firstRunCount.font = monoDigits(13, NSFontWeightMedium);
+  _firstRunCount.alignment = NSTextAlignmentCenter;
+  _firstRunSpinner = [NSProgressIndicator new];
+  _firstRunSpinner.style = NSProgressIndicatorStyleBar;
+  _firstRunSpinner.indeterminate = YES;
+  _firstRunSpinner.controlSize = NSControlSizeSmall;
+  fixSize(_firstRunSpinner, 260, 0);
+  NSTextField* hint = [NSTextField wrappingLabelWithString:
+      @"This happens once. Stale remembers the result, so the next launch is instant — "
+      @"re-index whenever you like with the Rescan button."];
+  hint.font = [NSFont systemFontOfSize:12];
+  hint.textColor = NSColor.tertiaryLabelColor;
+  hint.alignment = NSTextAlignmentCenter;
+  hint.selectable = NO;
+  NSButton* stop = [NSButton buttonWithTitle:@"Stop" target:self action:@selector(cancelScan:)];
+  stop.controlSize = NSControlSizeSmall;
+  stop.font = [NSFont systemFontOfSize:11];
+  NSStackView* col = [NSStackView stackViewWithViews:@[ icon, _firstRunTitle, _firstRunCount, _firstRunSpinner, hint, stop ]];
+  col.orientation = NSUserInterfaceLayoutOrientationVertical;
+  col.spacing = 8;
+  [col setCustomSpacing:16 afterView:icon];
+  [col setCustomSpacing:14 afterView:_firstRunCount];
+  [col setCustomSpacing:14 afterView:_firstRunSpinner];
+  [col setCustomSpacing:18 afterView:hint];
+  col.translatesAutoresizingMaskIntoConstraints = NO;
+  _firstRun = [NSView new];
+  [_firstRun addSubview:col];
+  [NSLayoutConstraint activateConstraints:@[
+    [col.centerXAnchor constraintEqualToAnchor:_firstRun.centerXAnchor],
+    [col.centerYAnchor constraintEqualToAnchor:_firstRun.centerYAnchor constant:-24],
+    [hint.widthAnchor constraintLessThanOrEqualToConstant:400],
+    [_firstRunTitle.widthAnchor constraintLessThanOrEqualToConstant:520],
+  ]];
+  _firstRun.hidden = YES;
+}
+
 - (NSView*)makeBanner {
-  NSImageView* icon = [NSImageView imageViewWithImage:symbol(@"lock.shield", 14, NSFontWeightMedium)];
-  icon.contentTintColor = NSColor.systemOrangeColor;
+  NSImageView* icon = [NSImageView imageViewWithImage:symbol(@"lock.shield.fill", 14, NSFontWeightMedium)];
+  icon.contentTintColor = kBucketColors[STALE];
   NSTextField* text = [NSTextField wrappingLabelWithString:
-      @"Some folders couldn't be read (Mail, Safari, Messages…). Give Stale Full Disk Access to see everything."];
+      @"Some folders couldn't be read (Mail, Safari, Messages…). Give Stale Full Disk Access, then Rescan, to see everything."];
   text.font = [NSFont systemFontOfSize:12];
   text.selectable = NO;
   NSButton* open = [NSButton buttonWithTitle:@"Open Privacy Settings" target:self action:@selector(openFDA:)];
@@ -821,8 +1280,8 @@ static const ModeInfo kModes[] = {
   row.spacing = 10;
   row.edgeInsets = NSEdgeInsetsMake(8, 12, 8, 10);
   row.wantsLayer = YES;
-  row.layer.backgroundColor = [NSColor.systemOrangeColor colorWithAlphaComponent:0.12].CGColor;
-  row.layer.cornerRadius = 8;
+  row.layer.backgroundColor = [kBucketColors[STALE] colorWithAlphaComponent:0.12].CGColor;
+  row.layer.cornerRadius = 10;
   [text setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
   return row;
 }
@@ -859,7 +1318,7 @@ static const ModeInfo kModes[] = {
     willBeInsertedIntoToolbar:(BOOL)flag {
   struct Def { NSString* id; NSString* label; NSString* symbol; SEL action; };
   Def defs[] = {
-      {@"folder", @"Scan Folder…", @"folder.badge.plus", @selector(chooseFolder:)},
+      {@"folder", @"Open Folder…", @"folder.badge.plus", @selector(chooseFolder:)},
       {@"rescan", @"Rescan", @"arrow.clockwise", @selector(rescan:)},
       {@"reveal", @"Reveal in Finder", @"magnifyingglass", @selector(revealSelected:)},
       {@"trash", @"Move to Trash", @"trash", @selector(trashSelected:)},
@@ -882,7 +1341,15 @@ static const ModeInfo kModes[] = {
 - (BOOL)validateToolbarItem:(NSToolbarItem*)item {
   if (item.action == @selector(trashSelected:) || item.action == @selector(revealSelected:))
     return [self selectedItems].count > 0;
-  return !_scanning;
+  if ([item.itemIdentifier isEqual:@"rescan"]) {
+    // Doubles as the Stop button while indexing.
+    BOOL busy = _scanning;
+    item.label = item.toolTip = busy ? @"Stop Indexing" : @"Rescan";
+    item.image = [NSImage imageWithSystemSymbolName:busy ? @"stop.circle" : @"arrow.clockwise" accessibilityDescription:item.label];
+    item.action = busy ? @selector(cancelScan:) : @selector(rescan:);
+    return !_loading;
+  }
+  return !_scanning && !_loading;
 }
 
 - (BOOL)validateMenuItem:(NSMenuItem*)item {
@@ -891,7 +1358,8 @@ static const ModeInfo kModes[] = {
     return [self selectedItems].count > 0;
   if (a == @selector(modeFromMenu:)) item.state = item.tag == (NSInteger)_mode ? NSControlStateValueOn : NSControlStateValueOff;
   if (a == @selector(cancelScan:)) return _scanning;
-  if (a == @selector(rescan:) || a == @selector(chooseFolder:) || a == @selector(scanHome:)) return !_scanning;
+  if (a == @selector(rescan:) || a == @selector(chooseFolder:) || a == @selector(openHome:) || a == @selector(openDisk:))
+    return !_scanning && !_loading;
   return YES;
 }
 
@@ -903,52 +1371,60 @@ static const ModeInfo kModes[] = {
   [[NSWorkspace sharedWorkspace]
       openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"]];
 }
+- (void)revealIndex:(id)sender {
+  NSString* dir = ns_str(indexDir());
+  [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+  [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[ [NSURL fileURLWithPath:dir] ]];
+}
 
-// ───── scanning ─────
+// ───── indexing ─────
 
 - (void)chooseFolder:(id)sender {
   NSOpenPanel* p = [NSOpenPanel openPanel];
   p.canChooseDirectories = YES;
   p.canChooseFiles = NO;
   p.allowsMultipleSelection = NO;
-  p.prompt = @"Scan";
-  p.message = @"Choose a folder to analyse";
-  p.directoryURL = [NSURL fileURLWithPath:ns_str(_scanPath)];
+  p.prompt = @"Open";
+  p.message = @"Choose a folder to analyse. Stale indexes it once and remembers the result.";
+  p.directoryURL = [NSURL fileURLWithPath:ns_str(_scanPath.empty() ? std::string("/") : _scanPath)];
   [p beginSheetModalForWindow:_window completionHandler:^(NSModalResponse r) {
-    if (r == NSModalResponseOK && p.URL) [self scanPath:std_str(p.URL.path)];
+    if (r == NSModalResponseOK && p.URL) [self openRoot:std_str(p.URL.path)];
   }];
 }
 
-- (void)scanHome:(id)sender { [self scanPath:std_str(NSHomeDirectory())]; }
+- (void)openDisk:(id)sender { [self openRoot:"/"]; }
+- (void)openHome:(id)sender { [self openRoot:std_str(NSHomeDirectory())]; }
 - (void)rescan:(id)sender { if (!_scanPath.empty()) [self scanPath:_scanPath]; }
 
-- (void)cancelScan:(id)sender {
-  if (!_scanning) return;
+// Show the saved index for `root` if there is one, otherwise index it now.
+- (void)openRoot:(const std::string&)rootRef {
+  const std::string root = rootRef;
   if (_cancel) _cancel->store(true);
-  ++_scanGeneration;
-  [self endScanUI];
-  _scanPath = _resultPath;
-  if (!_model.result || _model.result->dirs.empty()) {
-    _window.subtitle = @"";
-    [self showEmpty:@"Scan stopped" hint:@"Press Rescan, or choose another folder to analyse." symbol:@"stop.circle"];
-  } else {
-    _window.subtitle = [self summaryLine];
-  }
-}
-
-- (NSString*)summaryLine {
-  const DirNode& root = _model.result->dirs[0];
-  return [NSString stringWithFormat:@"%@  ·  %@  ·  %@", ns_str(_resultPath).stringByAbbreviatingWithTildeInPath,
-                                    fmtBytes(root.size), fmtCount(root.files, @"file")];
-}
-
-- (void)endScanUI {
-  _scanning = NO;
-  [_progressTimer invalidate];
-  _progressTimer = nil;
-  [_spinner stopAnimation:nil];
-  _overlay.hidden = YES;
+  int gen = ++_scanGeneration;
+  if (_scanning) [self endScanUI];
+  _scanPath = root;
+  _loading = YES;
+  [self updateStatusPill];
   [_window.toolbar validateVisibleItems];
+  if (root != _resultPath) {
+    // A different root: drop the old model rather than show it under a new title.
+    [self clearModel];
+    [self showMode:_mode];
+  }
+  std::string home = std_str(NSHomeDirectory());
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    auto res = std::make_shared<ScanResult>();
+    double saved = 0;
+    bool ok = loadIndex(indexPath(root), root, *res, &saved);
+    AppSources apps;
+    if (ok) apps = resolveApps(res, home, nullptr);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (gen != self->_scanGeneration) return;
+      self->_loading = NO;
+      if (ok) [self installResult:res apps:apps indexedAt:saved];
+      else [self scanPath:root];
+    });
+  });
 }
 
 - (void)scanPath:(const std::string&)pathRef {
@@ -956,23 +1432,28 @@ static const ModeInfo kModes[] = {
   if (_cancel) _cancel->store(true);  // stop any scan in flight; its result is dropped by generation check
   int gen = ++_scanGeneration;
   _scanPath = path;
+  _loading = NO;
   _progress = std::make_shared<std::atomic<uint64_t>>(0);
   _cancel = std::make_shared<std::atomic<bool>>(false);
   _scanning = YES;
+  if (path != _resultPath) [self clearModel];
 
-  NSString* nsPath = ns_str(path);
-  NSString* shown = nsPath.stringByAbbreviatingWithTildeInPath;
-  _window.subtitle = [NSString stringWithFormat:@"Scanning %@…", shown];
-  _overlay.hidden = NO;
-  [_spinner startAnimation:nil];
-  _overlayText.stringValue = [NSString stringWithFormat:@"Scanning %@", shown];
-  _overlayCount.stringValue = @"";
+  BOOL haveOld = _model.result && !_model.result->dirs.empty();
+  _firstRunTitle.stringValue = [NSString stringWithFormat:@"Indexing %@", [self titleForRoot:path]];
+  _firstRunCount.stringValue = @"Starting…";
+  if (!haveOld) {
+    [_firstRunSpinner startAnimation:nil];
+    [self showMode:_mode];
+  }
+  [self updateStatusPill];
   [_progressTimer invalidate];
   __weak StaleController* weakSelf = self;
   _progressTimer = [NSTimer scheduledTimerWithTimeInterval:0.15 repeats:YES block:^(NSTimer*) {
     StaleController* s = weakSelf;
     if (!s || !s->_progress) return;
-    s->_overlayCount.stringValue = fmtCount(s->_progress->load(), @"file");
+    NSString* n = fmtCount(s->_progress->load(), @"file");
+    s->_firstRunCount.stringValue = n;
+    s->_statusText.stringValue = [NSString stringWithFormat:@"Indexing… %@", n];
   }];
   [_window.toolbar validateVisibleItems];
 
@@ -985,39 +1466,69 @@ static const ModeInfo kModes[] = {
     o.progressFiles = progressPtr.get();
     o.cancel = cancelPtr.get();
     auto res = std::make_shared<ScanResult>(scan(o));
-    std::shared_ptr<ScanResult> sysApps, userApps;
-    if (!cancelPtr->load()) {
-      const std::string roots[2] = {"/Applications", home + "/Applications"};
-      for (int i = 0; i < 2; ++i) {
-        struct stat st;
-        if (::stat(roots[i].c_str(), &st) != 0) continue;
-        ScanOptions ao;
-        ao.root = roots[i];
-        ao.cancel = cancelPtr.get();
-        (i == 0 ? sysApps : userApps) = std::make_shared<ScanResult>(scan(ao));
-      }
+    if (cancelPtr->load()) return;  // cancelScan already restored the UI
+    double finished = unixNow();
+    AppSources apps;
+    if (!res->dirs.empty()) {
+      saveIndex(indexPath(path), path, *res, finished);  // only complete scans are remembered
+      apps = resolveApps(res, home, cancelPtr.get());
     }
+    if (cancelPtr->load()) return;
     dispatch_async(dispatch_get_main_queue(), ^{
       if (gen != self->_scanGeneration) return;
-      self->_model.result = res;
-      self->_model.apps[0] = sysApps;
-      self->_model.apps[1] = userApps;
-      self->_model.now = res->now;
-      [self scanFinished];
+      [self installResult:res apps:apps indexedAt:finished];
     });
   });
 }
 
-- (void)scanFinished {
+- (void)cancelScan:(id)sender {
+  if (!_scanning) return;
+  if (_cancel) _cancel->store(true);
+  ++_scanGeneration;
+  [self endScanUI];
+  _scanPath = _resultPath.empty() ? _scanPath : _resultPath;
+  [self updateStatusPill];
+  if (!_model.result || _model.result->dirs.empty()) {
+    [self showEmpty:@"Indexing stopped"
+               hint:@"Nothing was saved. Press Rescan to index, or open a smaller folder."
+             symbol:@"stop.circle"];
+  }
+}
+
+- (void)endScanUI {
+  _scanning = NO;
+  [_progressTimer invalidate];
+  _progressTimer = nil;
+  [_firstRunSpinner stopAnimation:nil];
+  [_window.toolbar validateVisibleItems];
+}
+
+- (void)clearModel {
+  _model = Model();
+  _root = nil;
+  _flat = @[];
+  _appItems = nil;
+  _resultPath.clear();
+  _fdaBanner.hidden = YES;
+  [_outline reloadData];
+  for (SidebarEntry* e in _entries) e.badge = nil;
+  [self reloadSidebarBadges];
+}
+
+- (void)installResult:(std::shared_ptr<ScanResult>)res apps:(AppSources)apps indexedAt:(double)at {
   [self endScanUI];
   _resultPath = _scanPath;
-  const ScanResult& r = *_model.result;
+  _model.result = res;
+  _model.apps = apps;
+  _model.now = unixNow();
+  _model.indexedAt = at;
+  const ScanResult& r = *res;
   if (r.dirs.empty()) {
-    _window.subtitle = @"";
     _root = nil;
     _flat = @[];
     _appItems = nil;
     [_outline reloadData];
+    [self updateStatusPill];
     [self showEmpty:@"Couldn't read this folder"
                hint:[NSString stringWithFormat:@"%@ isn't readable. Try another folder, or grant Full Disk Access.",
                                                ns_str(_scanPath).stringByAbbreviatingWithTildeInPath]
@@ -1028,35 +1539,98 @@ static const ModeInfo kModes[] = {
   _fdaBanner.hidden = r.errors < 20;
   _appItems = nil;
   [self refreshSummary];
+  [self updateStatusPill];
   [self showMode:_mode];
 }
 
-- (NSString*)scanTitle {
-  return _resultPath == std_str(NSHomeDirectory()) ? @"Home" : ns_str(_resultPath).lastPathComponent;
+- (NSString*)titleForRoot:(const std::string&)root {
+  if (root == "/") return displayName(@"/");
+  if (root == std_str(NSHomeDirectory())) return @"Home";
+  return displayName(ns_str(root));
+}
+- (NSString*)scanTitle { return [self titleForRoot:_resultPath]; }
+
+- (void)updateStatusPill {
+  BOOL have = _model.result && !_model.result->dirs.empty();
+  if (_scanning) {
+    _statusPill.hidden = NO;
+    _statusIcon.hidden = YES;
+    [_statusSpinner startAnimation:nil];
+    _statusStop.hidden = NO;
+    _statusText.stringValue = @"Indexing…";
+    _statusPill.toolTip = @"Your existing index stays until this finishes.";
+  } else if (_loading) {
+    _statusPill.hidden = NO;
+    _statusIcon.hidden = YES;
+    [_statusSpinner startAnimation:nil];
+    _statusStop.hidden = YES;
+    _statusText.stringValue = @"Opening index…";
+    _statusPill.toolTip = @"";
+  } else if (have) {
+    const ScanResult& r = *_model.result;
+    _statusPill.hidden = NO;
+    _statusIcon.hidden = NO;
+    [_statusSpinner stopAnimation:nil];
+    _statusStop.hidden = YES;
+    _statusText.stringValue = [NSString stringWithFormat:@"Indexed %@", fmtIndexedAgo(_model.indexedAt, unixNow())];
+    _statusPill.toolTip = [NSString stringWithFormat:@"%@\n%@ · scanned in %.1f s%@\nRescan (⌘R) to refresh.",
+                                                     fmtDateTime(_model.indexedAt), fmtCount(r.dirs[0].files, @"file"), r.seconds,
+                                                     r.errors ? [NSString stringWithFormat:@" · %@ unreadable", fmtCount(r.errors, @"folder")] : @""];
+  } else {
+    _statusPill.hidden = YES;
+    [_statusSpinner stopAnimation:nil];
+  }
+  _window.subtitle = have ? [self summaryLine] : (_scanning ? @"Indexing…" : @"");
 }
 
-// Header, usage bar, legend, cards, sidebar badges; recomputed after a scan and after trashing.
+- (NSString*)summaryLine {
+  const DirNode& root = _model.result->dirs[0];
+  return [NSString stringWithFormat:@"%@  ·  %@  ·  %@", ns_str(_resultPath).stringByAbbreviatingWithTildeInPath,
+                                    fmtBytes(root.size), fmtCount(root.files, @"file")];
+}
+
+// ───── persistence after edits ─────
+
+// Trashing edits the in-memory model; write it back so the next launch matches. Debounced,
+// encoded on the main thread (tens of ms) and written off it.
+- (void)persistIndexSoon {
+  [_persistTimer invalidate];
+  __weak StaleController* weakSelf = self;
+  _persistTimer = [NSTimer scheduledTimerWithTimeInterval:1.5 repeats:NO block:^(NSTimer*) {
+    StaleController* s = weakSelf;
+    if (!s) return;
+    s->_persistTimer = nil;
+    [s persistIndexNow];
+  }];
+}
+
+- (void)persistIndexNow {
+  if (!_model.result || _model.result->dirs.empty() || _resultPath.empty()) return;
+  std::string bytes = encodeIndex(_resultPath, *_model.result, _model.indexedAt);
+  std::string file = indexPath(_resultPath);
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ writeIndex(file, bytes); });
+}
+
+// ───── summary ─────
+
+// Ring, bar, legend, cards, sidebar badges, biggest folders; recomputed after a scan and after trashing.
 - (void)refreshSummary {
   const ScanResult& r = *_model.result;
   const DirNode& root = r.dirs[0];
 
   _window.subtitle = [self summaryLine];
-  _bigNumber.stringValue = fmtBytes(root.size);
-  _bigSub.stringValue = [NSString
-      stringWithFormat:@"in %@  ·  %@  ·  scanned in %.1f s%@", ns_str(_resultPath).stringByAbbreviatingWithTildeInPath,
-                       fmtCount(root.files, @"file"), r.seconds,
-                       r.spotlightHits ? @"" : @"  ·  no Spotlight “last opened” data here, so dates are last modified"];
+  [self rebuildRing];
 
   std::vector<double> parts;
   for (int b = 0; b < NBUCKETS; ++b) parts.push_back((double)root.bucketSize[b]);
   _bar.parts = parts;
-  [_bar setNeedsDisplay:YES];
 
   for (NSView* v in [_legend.views copy]) [_legend removeView:v];
   for (int b = 0; b <= NBUCKETS; ++b) {
     uint64_t bytes = b < NBUCKETS ? root.bucketSize[b] : root.neverOpenedSize;
     double pct = root.size ? 100.0 * bytes / root.size : 0;
-    [_legend addView:[self legendItem:b bytes:bytes pct:pct] inGravity:NSStackViewGravityLeading];
+    NSView* row = [self legendRow:b bytes:bytes pct:pct];
+    [_legend addView:row inGravity:NSStackViewGravityTop];
   }
 
   // Flat lists for the other modes.
@@ -1071,13 +1645,13 @@ static const ModeInfo kModes[] = {
   uint64_t bigBytes = 0;
   size_t bigCount = 0;
   for (const FileRec& f : r.bigFiles)
-    if (bucketFor(f.lastUsed, r.now) >= STALE) { bigBytes += f.size; ++bigCount; }
+    if (bucketFor(f.lastUsed, _model.now) >= STALE) { bigBytes += f.size; ++bigCount; }
   if (!_appItems) [self buildAppItems];
   uint64_t appBytes = 0, unusedAppBytes = 0;
   size_t unusedApps = 0;
   for (Item* it in _appItems) {
     appBytes += it.size;
-    if (it.lastUsed <= 0 || bucketFor(it.lastUsed, r.now) >= STALE) { unusedAppBytes += it.size; ++unusedApps; }
+    if (it.lastUsed <= 0 || bucketFor(it.lastUsed, _model.now) >= STALE) { unusedAppBytes += it.size; ++unusedApps; }
   }
 
   auto card = [&](Mode m) -> CardView* {
@@ -1109,87 +1683,163 @@ static const ModeInfo kModes[] = {
       default: e.badge = nil;
     }
   }
+  [self reloadSidebarBadges];
+
+  // Biggest top-level folders.
+  for (NSView* v in [_topList.views copy]) [_topList removeView:v];
+  std::vector<int32_t> kids;
+  for (int32_t c : root.children) if (!r.dirs[c].path.empty() && r.dirs[c].size > 0) kids.push_back(c);
+  std::sort(kids.begin(), kids.end(), [&](int32_t a, int32_t b) { return r.dirs[a].size > r.dirs[b].size; });
+  if (kids.size() > 8) kids.resize(8);
+  for (size_t i = 0; i < kids.size(); ++i) {
+    if (i) {
+      HairlineView* h = [HairlineView new];
+      fixSize(h, 0, 1);
+      [_topList addView:h inGravity:NSStackViewGravityTop];
+      [h.widthAnchor constraintEqualToAnchor:_topList.widthAnchor constant:-8].active = YES;
+    }
+    NSView* row = [self topRow:r.dirs[kids[i]] total:root.size];
+    [_topList addView:row inGravity:NSStackViewGravityTop];
+    [row.widthAnchor constraintEqualToAnchor:_topList.widthAnchor].active = YES;
+  }
+  _topTitle.hidden = _topSurface.hidden = kids.empty();
+}
+
+- (void)reloadSidebarBadges {
   // Refresh badges in place; reloadData would drop the selection and bounce the mode.
   if (_sidebar.numberOfRows == 0) [_sidebar reloadData];
   else [_sidebar reloadDataForRowIndexes:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, (NSUInteger)_sidebar.numberOfRows)]
                            columnIndexes:[NSIndexSet indexSetWithIndex:0]];
   [self syncSidebar];
-
-  // Biggest top-level folders.
-  for (NSView* v in [_topList.views copy]) [_topList removeView:v];
-  std::vector<int32_t> kids;
-  for (int32_t c : root.children) if (!r.dirs[c].path.empty()) kids.push_back(c);
-  std::sort(kids.begin(), kids.end(), [&](int32_t a, int32_t b) { return r.dirs[a].size > r.dirs[b].size; });
-  if (kids.size() > 8) kids.resize(8);
-  for (int32_t c : kids) {
-    const DirNode& d = r.dirs[c];
-    NSView* row = [self topRow:d total:root.size];
-    [_topList addView:row inGravity:NSStackViewGravityTop];
-    [row.widthAnchor constraintEqualToAnchor:_topList.widthAnchor].active = YES;
-  }
-  _topTitle.hidden = _topList.hidden = kids.empty();
 }
 
-- (NSView*)legendItem:(int)bucket bytes:(uint64_t)bytes pct:(double)pct {
+- (void)rebuildRing {
+  const ScanResult& r = *_model.result;
+  const DirNode& root = r.dirs[0];
+  std::vector<RingSeg> segs;
+  uint64_t total = root.size;
+  if (total == 0) {
+    _ring.segs = segs;
+    _ring.centerTitle = fmtBytes(0);
+    _ring.centerSub = [self scanTitle];
+    return;
+  }
+  auto sortedKids = [&](const DirNode& d) {
+    std::vector<int32_t> k;
+    for (int32_t c : d.children) if (!r.dirs[c].path.empty() && r.dirs[c].size > 0) k.push_back(c);
+    std::sort(k.begin(), k.end(), [&](int32_t a, int32_t b) { return r.dirs[a].size > r.dirs[b].size; });
+    return k;
+  };
+  auto detail = [&](const DirNode& d, uint64_t of) {
+    return [NSString stringWithFormat:@"%@ · %.0f%%\n%@", fmtBytes(d.size), 100.0 * d.size / of,
+                                      fmtAgo(d.lastUsed, _model.now)];
+  };
+  const double minFrac = 0.006;  // ~2°; anything thinner is pooled into "everything else"
+  double cursor = 0;
+  int hue = 0;
+  uint64_t other = 0, placed = 0;
+  for (int32_t c : sortedKids(root)) {
+    const DirNode& d = r.dirs[c];
+    double frac = (double)d.size / total;
+    if (frac < minFrac || hue >= kRingPalette) { other += d.size; continue; }
+    RingSeg s{c, cursor, cursor + frac, 0, hue, 0, displayName(ns_str(d.path)), detail(d, total)};
+    segs.push_back(s);
+    // Outer ring: this folder's own folders, largest first, remainder = its loose files.
+    double sub = cursor;
+    uint64_t subPlaced = 0;
+    int shade = 0;
+    for (int32_t g : sortedKids(d)) {
+      const DirNode& gd = r.dirs[g];
+      double gf = (double)gd.size / total;
+      if (gf < minFrac) break;
+      segs.push_back(RingSeg{g, sub, sub + gf, 1, hue, shade++ & 1, ns_str(gd.path).lastPathComponent, detail(gd, d.size)});
+      sub += gf;
+      subPlaced += gd.size;
+    }
+    if (d.size > subPlaced) {
+      NSString* rest = [NSString stringWithFormat:@"%@ · %.0f%%\nfiles and small folders", fmtBytes(d.size - subPlaced),
+                                                  100.0 * (d.size - subPlaced) / d.size];
+      segs.push_back(RingSeg{-1, sub, cursor + frac, 1, hue, 0, [NSString stringWithFormat:@"Rest of %@", s.name], rest});
+    }
+    cursor += frac;
+    placed += d.size;
+    ++hue;
+  }
+  if (other > 0) {
+    segs.push_back(RingSeg{-1, cursor, cursor + (double)other / total, 0, -1, 0, @"Smaller folders",
+                           [NSString stringWithFormat:@"%@ · %.0f%%", fmtBytes(other), 100.0 * other / total]});
+    cursor += (double)other / total;
+    placed += other;
+  }
+  if (total > placed) {
+    uint64_t loose = total - placed;
+    segs.push_back(RingSeg{-1, cursor, 1.0, 0, -1, 1, @"Files here",
+                           [NSString stringWithFormat:@"%@ · %.0f%%", fmtBytes(loose), 100.0 * loose / total]});
+  }
+  _ring.segs = std::move(segs);
+  _ring.centerTitle = fmtBytes(total);
+  _ring.centerSub = [self scanTitle];
+}
+
+- (NSView*)legendRow:(int)bucket bytes:(uint64_t)bytes pct:(double)pct {
   NSView* dot = [NSView new];
   dot.wantsLayer = YES;
   dot.layer.backgroundColor = kBucketColors[bucket].CGColor;
-  dot.layer.cornerRadius = 4;
-  [dot.widthAnchor constraintEqualToConstant:8].active = YES;
-  [dot.heightAnchor constraintEqualToConstant:8].active = YES;
-  NSTextField* name = label(kBucketLabels[bucket], 11, NSFontWeightMedium, NSColor.secondaryLabelColor);
-  NSStackView* top = [NSStackView stackViewWithViews:@[ dot, name ]];
-  top.spacing = 5;
-  NSTextField* val = label([NSString stringWithFormat:@"%@", fmtBytes(bytes)], 13, NSFontWeightSemibold, NSColor.labelColor);
-  val.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold];
-  NSTextField* p = label([NSString stringWithFormat:@"%.0f%%", pct], 11, NSFontWeightRegular, NSColor.tertiaryLabelColor);
-  p.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular];
-  NSStackView* bottom = [NSStackView stackViewWithViews:@[ val, p ]];
-  bottom.spacing = 4;
-  bottom.alignment = NSLayoutAttributeFirstBaseline;
-  NSStackView* col = [NSStackView stackViewWithViews:@[ top, bottom ]];
-  col.orientation = NSUserInterfaceLayoutOrientationVertical;
-  col.alignment = NSLayoutAttributeLeading;
-  col.spacing = 3;
-  [name setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-  return col;
+  dot.layer.cornerRadius = 4.5;
+  fixSize(dot, 9, 9);
+  NSTextField* name = label(kBucketLabels[bucket], 12, NSFontWeightMedium, NSColor.labelColor);
+  if (bucket == NBUCKETS) name.textColor = NSColor.secondaryLabelColor;
+  fixSize(name, 112, 0);
+  NSTextField* val = label(fmtBytes(bytes), 12, NSFontWeightSemibold, NSColor.labelColor);
+  val.font = monoDigits(12, NSFontWeightSemibold);
+  val.alignment = NSTextAlignmentRight;
+  fixSize(val, 78, 0);
+  NSTextField* p = label([NSString stringWithFormat:@"%.0f%%", pct], 11, NSFontWeightMedium, NSColor.tertiaryLabelColor);
+  p.font = monoDigits(11, NSFontWeightMedium);
+  p.alignment = NSTextAlignmentRight;
+  fixSize(p, 34, 0);
+  NSStackView* row = [NSStackView stackViewWithViews:@[ dot, name, val, p ]];
+  row.spacing = 8;
+  row.alignment = NSLayoutAttributeCenterY;
+  [row setHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+  row.toolTip = bucket == NBUCKETS ? @"Files created and never opened or changed since (overlaps the other buckets)."
+                                   : [NSString stringWithFormat:@"Data last used %@.", kBucketLabels[bucket].lowercaseString];
+  return row;
 }
 
 - (NSView*)topRow:(const DirNode&)d total:(uint64_t)total {
   NSString* path = ns_str(d.path);
   NSImageView* icon = [NSImageView imageViewWithImage:[[NSWorkspace sharedWorkspace] iconForFile:path]];
-  [icon.widthAnchor constraintEqualToConstant:18].active = YES;
-  [icon.heightAnchor constraintEqualToConstant:18].active = YES;
-  NSTextField* name = label(path.lastPathComponent, 13, NSFontWeightRegular, NSColor.labelColor);
+  fixSize(icon, 20, 20);
+  NSTextField* name = label(displayName(path), 13, NSFontWeightMedium, NSColor.labelColor);
   NSString* hint = categoryHint(d.category);
-  NSTextField* note = label(hint.length ? categoryTitle(d.category) : fmtCount(d.files, @"file"), 12, NSFontWeightRegular,
+  NSTextField* note = label(hint.length ? categoryTitle(d.category) : fmtCount(d.files, @"file"), 11, NSFontWeightRegular,
                             NSColor.tertiaryLabelColor);
-  UsageBarView* bar = [UsageBarView new];
+  RecencyBarView* bar = [RecencyBarView new];
+  bar.gap = 1;
   std::vector<double> parts;
   for (int b = 0; b < NBUCKETS; ++b) parts.push_back((double)d.bucketSize[b]);
   bar.parts = parts;
-  [bar.heightAnchor constraintEqualToConstant:6].active = YES;
-  NSLayoutConstraint* w = [bar.widthAnchor constraintEqualToConstant:std::max(6.0, 160.0 * (total ? (double)d.size / total : 0))];
-  w.active = YES;
+  fixSize(bar, std::max(6.0, 150.0 * (total ? (double)d.size / total : 0)), 6);
   NSView* barBox = [NSView new];
   bar.translatesAutoresizingMaskIntoConstraints = NO;
   [barBox addSubview:bar];
   [NSLayoutConstraint activateConstraints:@[
-    [barBox.widthAnchor constraintEqualToConstant:160],
+    [barBox.widthAnchor constraintEqualToConstant:150],
     [bar.leadingAnchor constraintEqualToAnchor:barBox.leadingAnchor],
     [bar.centerYAnchor constraintEqualToAnchor:barBox.centerYAnchor],
     [barBox.heightAnchor constraintEqualToConstant:6],
   ]];
-  NSTextField* size = label(fmtBytes(d.size), 13, NSFontWeightMedium, NSColor.labelColor);
-  size.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightMedium];
+  NSTextField* size = label(fmtBytes(d.size), 13, NSFontWeightSemibold, NSColor.labelColor);
+  size.font = monoDigits(13, NSFontWeightSemibold);
   size.alignment = NSTextAlignmentRight;
-  [size.widthAnchor constraintEqualToConstant:80].active = YES;
+  fixSize(size, 84, 0);
   NSTextField* used = label(fmtAgo(d.lastUsed, _model.now), 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
   used.alignment = NSTextAlignmentRight;
-  [used.widthAnchor constraintEqualToConstant:110].active = YES;
+  fixSize(used, 100, 0);
   NSStackView* row = [NSStackView stackViewWithViews:@[ icon, name, note, barBox, size, used ]];
   row.spacing = 10;
-  row.edgeInsets = NSEdgeInsetsMake(6, 4, 6, 4);
+  row.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
   for (NSView* v in @[ icon, name, size, used ])
     [v setContentHuggingPriority:NSLayoutPriorityRequired - 1 forOrientation:NSLayoutConstraintOrientationHorizontal];
   [note setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
@@ -1203,12 +1853,14 @@ static const ModeInfo kModes[] = {
 - (void)buildAppItems {
   _appItems = [NSMutableArray new];
   for (int k = 0; k < 2; ++k) {
-    if (!_model.apps[k] || _model.apps[k]->dirs.empty()) continue;
-    const ScanResult& ar = *_model.apps[k];
+    const AppSource& src = _model.apps.s[k];
+    if (!src.r || src.r->dirs.empty() || src.dirId < 0) continue;
+    const ScanResult& ar = *src.r;
     std::vector<int32_t> appIds;
-    collectUnits(ar, 0, appIds, [](const DirNode& d) { return d.category == CAT_APP; });
+    collectUnits(ar, src.dirId, appIds, [](const DirNode& d) { return d.category == CAT_APP; });
     for (int32_t i : appIds) {
       const DirNode& d = ar.dirs[i];
+      if (d.path.empty() || access(d.path.c_str(), F_OK) != 0) continue;  // gone since the index was made
       Item* it = [Item new];
       it.path = ns_str(d.path);
       it.name = [it.path.lastPathComponent stringByDeletingPathExtension];
@@ -1220,7 +1872,7 @@ static const ModeInfo kModes[] = {
       it.isDir = YES;
       it.isApp = YES;
       it.category = CAT_APP;
-      it.dirId = -1;
+      it.dirId = src.inMain ? i : -1;  // in-main apps edit the shared model when trashed
       it.children = [NSMutableArray new];  // don't drill into bundles
       [_appItems addObject:it];
     }
@@ -1269,13 +1921,15 @@ static const ModeInfo kModes[] = {
       [kids addObject:[self itemForDir:c parent:item]];
     }
   }
-  // Files are not kept by the scanner; list them now.
+  // Files are not kept in the index; list them now.
   if (DIR* dp = opendir(item.path.fileSystemRepresentation)) {
     struct stat st;
     while (struct dirent* de = readdir(dp)) {
       if (de->d_name[0] == '.' && (de->d_name[1] == 0 || (de->d_name[1] == '.' && de->d_name[2] == 0))) continue;
       if (fstatat(dirfd(dp), de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || S_ISDIR(st.st_mode)) continue;
-      std::string full = std_str(item.path) + "/" + de->d_name;
+      std::string full = std_str(item.path);
+      if (full.empty() || full.back() != '/') full += '/';
+      full += de->d_name;
       double mt = st.st_mtimespec.tv_sec, lu = mt;
       auto md = r.spotlight.find(full);
       bool hasMd = md != r.spotlight.end();
@@ -1326,6 +1980,7 @@ static const ModeInfo kModes[] = {
 
 - (void)showEmpty:(NSString*)title hint:(NSString*)hint symbol:(NSString*)sym {
   _overviewScroll.hidden = YES;
+  _firstRun.hidden = YES;
   _listBox.hidden = NO;
   _scroll.hidden = YES;
   _bottom.hidden = YES;
@@ -1342,14 +1997,27 @@ static const ModeInfo kModes[] = {
   const ScanResult* r = _model.result.get();
   BOOL haveScan = r && !r->dirs.empty();
 
-  _pageTitle.stringValue = m == Mode::Overview ? [self scanTitle] : mi.title;
+  _pageTitle.stringValue = m == Mode::Overview ? (haveScan ? [self scanTitle] : [self titleForRoot:_scanPath]) : mi.title;
   _pageHint.stringValue = m == Mode::Overview ? @"" : mi.hint;
   _pageHint.hidden = m == Mode::Overview;
 
   if (!haveScan) {
-    if (!_scanning) [self showEmpty:@"Nothing scanned yet" hint:@"Choose a folder to analyse." symbol:@"folder.badge.questionmark"];
+    if (_scanning) {
+      _overviewScroll.hidden = YES;
+      _listBox.hidden = YES;
+      _bottom.hidden = YES;
+      _firstRun.hidden = NO;
+    } else if (_loading) {
+      _overviewScroll.hidden = YES;
+      _listBox.hidden = YES;
+      _bottom.hidden = YES;
+      _firstRun.hidden = YES;
+    } else {
+      [self showEmpty:@"Nothing indexed yet" hint:@"Press Rescan to index this folder." symbol:@"internaldrive"];
+    }
     return;
   }
+  _firstRun.hidden = YES;
   if (m == Mode::Overview) {
     _overviewScroll.hidden = NO;
     _listBox.hidden = YES;
@@ -1358,25 +2026,27 @@ static const ModeInfo kModes[] = {
   }
 
   NSMutableArray<Item*>* flat = [NSMutableArray new];
+  auto stillThere = [](const std::string& p) { return !p.empty() && access(p.c_str(), F_OK) == 0; };
   switch (m) {
     case Mode::Reclaim: {
       std::vector<int32_t> ids;
       collectUnits(*r, 0, ids, [](const DirNode& d) { return categoryReclaimable(d.category); });
-      for (int32_t i : ids) [flat addObject:[self itemForDir:i parent:nil]];
+      for (int32_t i : ids) if (stillThere(r->dirs[i].path)) [flat addObject:[self itemForDir:i parent:nil]];
       break;
     }
     case Mode::Forgotten: {
       std::vector<int32_t> ids;
       collectForgotten(*r, 0, ids, 50ull << 20);
-      for (int32_t i : ids) [flat addObject:[self itemForDir:i parent:nil]];
+      for (int32_t i : ids) if (stillThere(r->dirs[i].path)) [flat addObject:[self itemForDir:i parent:nil]];
       break;
     }
     case Mode::BigFiles:
       for (const FileRec& f : r->bigFiles)
-        if (bucketFor(f.lastUsed, r->now) >= STALE)
+        if (bucketFor(f.lastUsed, _model.now) >= STALE && stillThere(f.path))
           [flat addObject:[self itemForFile:f.path size:f.size lastUsed:f.lastUsed never:f.neverOpened parent:nil]];
       break;
     case Mode::Apps:
+      if (!_appItems) [self buildAppItems];
       [flat addObjectsFromArray:_appItems ?: @[]];
       break;
     default: break;
@@ -1417,6 +2087,33 @@ static const ModeInfo kModes[] = {
 - (void)modeFromMenu:(NSMenuItem*)mi { [self showMode:(Mode)mi.tag]; }
 - (void)cardClicked:(CardView*)c { [self showMode:c.mode]; }
 
+// Clicking a ring segment opens All folders with that folder expanded and selected.
+- (void)ringClicked:(RingView*)ring {
+  int32_t id = ring.clickedDir;
+  if (id < 0 || !_model.result) return;
+  const ScanResult& r = *_model.result;
+  std::vector<int32_t> chain;  // root … target
+  for (int32_t d = id; d >= 0; d = r.dirs[(size_t)d].parent) chain.push_back(d);
+  std::reverse(chain.begin(), chain.end());
+  [self showMode:Mode::Browse];
+  Item* cur = _root;
+  for (size_t i = 1; i < chain.size() && cur; ++i) {
+    [self loadChildren:cur];
+    Item* next = nil;
+    for (Item* k in cur.children) if (k.dirId == chain[i]) { next = k; break; }
+    if (!next) break;
+    if (i + 1 < chain.size()) [_outline expandItem:next];
+    cur = next;
+  }
+  if (!cur || cur == _root) return;
+  [_outline expandItem:cur];
+  NSInteger row = [_outline rowForItem:cur];
+  if (row >= 0) {
+    [_outline selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)row] byExtendingSelection:NO];
+    [_outline scrollRowToVisible:row];
+  }
+}
+
 // ───── outline data source (sidebar + tree) ─────
 
 - (NSInteger)outlineView:(NSOutlineView*)ov numberOfChildrenOfItem:(Item*)item {
@@ -1444,7 +2141,7 @@ static const ModeInfo kModes[] = {
   return YES;
 }
 - (CGFloat)outlineView:(NSOutlineView*)ov heightOfRowByItem:(id)obj {
-  if (ov == _sidebar) return ((SidebarEntry*)obj).isGroup ? 26 : 28;
+  if (ov == _sidebar) return ((SidebarEntry*)obj).isGroup ? 28 : 30;
   return ov.rowHeight;
 }
 
@@ -1486,10 +2183,10 @@ static const ModeInfo kModes[] = {
     [NSLayoutConstraint activateConstraints:@[
       [iv.leadingAnchor constraintEqualToAnchor:v.leadingAnchor constant:2],
       [iv.centerYAnchor constraintEqualToAnchor:v.centerYAnchor],
-      [iv.widthAnchor constraintEqualToConstant:16],
-      [iv.heightAnchor constraintEqualToConstant:16],
+      [iv.widthAnchor constraintEqualToConstant:17],
+      [iv.heightAnchor constraintEqualToConstant:17],
     ]];
-    lead = 24;
+    lead = 25;
   }
   [NSLayoutConstraint activateConstraints:@[
     [t.leadingAnchor constraintEqualToAnchor:v.leadingAnchor constant:lead],
@@ -1527,8 +2224,8 @@ static const ModeInfo kModes[] = {
     iv.imageScaling = NSImageScaleProportionallyDown;
     NSTextField* t = label(@"", 13, NSFontWeightRegular, NSColor.labelColor);
     t.translatesAutoresizingMaskIntoConstraints = NO;
-    badge = label(@"", 11, NSFontWeightMedium, NSColor.secondaryLabelColor);
-    badge.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightMedium];
+    badge = label(@"", 11, NSFontWeightMedium, NSColor.tertiaryLabelColor);
+    badge.font = monoDigits(11, NSFontWeightMedium);
     badge.translatesAutoresizingMaskIntoConstraints = NO;
     badge.identifier = @"badge";
     [v addSubview:iv];
@@ -1570,6 +2267,7 @@ static const ModeInfo kModes[] = {
     if (!item.icon) item.icon = [[NSWorkspace sharedWorkspace] iconForFile:item.path];
     v.imageView.image = item.icon;
     NSString* name = _mode == Mode::Browse || item.parent || item.isApp ? item.name : [item.path stringByAbbreviatingWithTildeInPath];
+    if (_mode == Mode::Browse && !item.parent) name = displayName(item.path);
     v.textField.stringValue = name;
     v.textField.textColor = NSColor.labelColor;
     v.toolTip = item.path;
@@ -1579,7 +2277,7 @@ static const ModeInfo kModes[] = {
     SizeCellView* v = (SizeCellView*)[self cellWithId:@"sizeCell" inView:ov image:NO size:YES];
     v.textField.alignment = NSTextAlignmentRight;
     v.textField.stringValue = fmtBytes(item.size);
-    v.textField.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular];
+    v.textField.font = monoDigits(13, NSFontWeightRegular);
     uint64_t base = item.parent ? item.parent.size : (_root ? _root.size : 0);
     if (!item.parent && _mode != Mode::Browse) {
       base = 0;
@@ -1597,7 +2295,7 @@ static const ModeInfo kModes[] = {
     else text = fmtAgo(item.lastUsed, now);
     NSMutableAttributedString* s = [[NSMutableAttributedString alloc]
         initWithString:@"● "
-            attributes:@{NSForegroundColorAttributeName : color, NSFontAttributeName : [NSFont systemFontOfSize:11]}];
+            attributes:@{NSForegroundColorAttributeName : color, NSFontAttributeName : [NSFont systemFontOfSize:10]}];
     [s appendAttributedString:[[NSAttributedString alloc]
                                   initWithString:text
                                       attributes:@{
@@ -1605,11 +2303,7 @@ static const ModeInfo kModes[] = {
                                         NSFontAttributeName : [NSFont systemFontOfSize:13]
                                       }]];
     v.textField.attributedStringValue = s;
-    v.toolTip = item.lastUsed > 0
-                    ? [NSDateFormatter localizedStringFromDate:[NSDate dateWithTimeIntervalSince1970:item.lastUsed]
-                                                     dateStyle:NSDateFormatterMediumStyle
-                                                     timeStyle:NSDateFormatterShortStyle]
-                    : @"";
+    v.toolTip = item.lastUsed > 0 ? fmtDateTime(item.lastUsed) : @"";
     return v;
   }
   // note
@@ -1756,6 +2450,7 @@ static const ModeInfo kModes[] = {
   if (_model.result && !_model.result->dirs.empty()) {
     [self refreshSummary];
     if ([self topItems].count == 0) [self showMode:_mode];  // switch to the empty state
+    if (moved) [self persistIndexSoon];
   }
   _status.stringValue = [NSString stringWithFormat:@"Moved %@ to the Trash.", fmtBytes(moved)];
   if (failures.count) {
