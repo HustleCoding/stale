@@ -2,7 +2,9 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/attr.h>
 #include <sys/stat.h>
+#include <sys/vnode.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -16,6 +18,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 
 namespace stale {
 
@@ -163,16 +166,31 @@ struct WorkItem {
   std::string name;
 };
 
+// One directory entry, from getattrlistbulk or the readdir fallback.
+struct Entry {
+  const char* name;
+  bool isDir;
+  uint64_t alloc;
+  double mtime, atime, birth;
+};
+
+double ts(const struct timespec& t) { return t.tv_sec + t.tv_nsec * 1e-9; }
+
 struct Walker {
   const ScanOptions& opts;
   const std::unordered_map<std::string, double>& md;
+  std::unordered_set<std::string> mdDirs;  // directories containing at least one Spotlight hit
   std::string home;
   double now;
-  dev_t rootDev = 0;
+  std::vector<dev_t> allowedDevs;
+  // The data volume is reached through firmlinks (/Users, /Applications, …); walking its
+  // mount point as well would count everything twice.
+  std::vector<std::string> skipDirs{"/System/Volumes/Data"};
 
   std::mutex mu;
   std::condition_variable cv;
   std::vector<WorkItem> queue;
+  std::atomic<size_t> queued{0};  // queue.size(), readable without the lock
   std::atomic<int32_t> nextId{0};
   std::atomic<int64_t> pending{0};
   std::atomic<uint64_t> files{0};
@@ -186,6 +204,16 @@ struct Walker {
       : opts(o), md(m), now(n) {
     const char* h = getenv("HOME");
     if (h) home = h;
+    mdDirs.reserve(md.size() / 4 + 16);
+    for (const auto& kv : md) {
+      size_t slash = kv.first.find_last_of('/');
+      if (slash != std::string::npos) mdDirs.emplace(kv.first.substr(0, slash == 0 ? 1 : slash));
+    }
+  }
+
+  bool devAllowed(dev_t d) const {
+    if (!opts.sameDevice) return true;
+    return std::find(allowedDevs.begin(), allowedDevs.end(), d) != allowedDevs.end();
   }
 
   void push(WorkItem w) {
@@ -193,28 +221,163 @@ struct Walker {
     {
       std::lock_guard<std::mutex> lk(mu);
       queue.push_back(std::move(w));
+      queued.store(queue.size(), std::memory_order_relaxed);
     }
     cv.notify_one();
   }
 
-  double lastUsedOf(const struct stat& st, const std::string& path, bool* hasMd) {
-    double m = st.st_mtimespec.tv_sec + st.st_mtimespec.tv_nsec * 1e-9;
-    double lu = m;
-    if (opts.useAtime) {
-      double a = st.st_atimespec.tv_sec + st.st_atimespec.tv_nsec * 1e-9;
-      lu = std::max(lu, a);
-    }
-    auto it = md.find(path);
-    *hasMd = it != md.end();
-    if (*hasMd) lu = std::max(lu, it->second);
-    if (lu > now) lu = now;
-    return lu;
+  void storeNode(int32_t id, DirNode&& node) {
+    std::lock_guard<std::mutex> lk(resMu);
+    if (nodes.size() <= static_cast<size_t>(id)) nodes.resize(id + 1024);
+    nodes[id] = std::move(node);
   }
 
-  void processDir(const WorkItem& w) {
+  struct DirCtx {
+    const WorkItem& w;
+    DirNode& node;
+    std::vector<WorkItem>& subdirs;
+    bool dirHasMd;
+    std::string full;  // scratch: w.path + "/" + name
+    uint64_t nfiles = 0;
+  };
+
+  void joinPath(DirCtx& c, const char* name) {
+    c.full.assign(c.w.path);
+    if (c.full.empty() || c.full.back() != '/') c.full += '/';
+    c.full += name;
+  }
+
+  void onEntry(DirCtx& c, const Entry& e) {
+    if (e.isDir) {
+      joinPath(c, e.name);
+      c.subdirs.push_back(WorkItem{nextId.fetch_add(1, std::memory_order_relaxed), c.w.id, c.full, e.name});
+      return;
+    }
+    double lu = e.mtime;
+    if (opts.useAtime) lu = std::max(lu, e.atime);
+    bool bigFile = e.alloc >= opts.bigFileBytes;
+    bool hasMd = false;
+    if (c.dirHasMd || bigFile) joinPath(c, e.name);
+    if (c.dirHasMd) {
+      auto it = md.find(c.full);
+      hasMd = it != md.end();
+      if (hasMd) lu = std::max(lu, it->second);
+    }
+    if (lu > now) lu = now;
+    bool never = !hasMd && std::fabs(e.mtime - e.birth) < 60 && (now - e.birth) > 30 * 86400.0;
+    DirNode& node = c.node;
+    node.size += e.alloc;
+    node.bucketSize[bucketFor(lu, now)] += e.alloc;
+    if (never) node.neverOpenedSize += e.alloc;
+    if (lu > node.lastUsed) node.lastUsed = lu;
+    ++c.nfiles;
+    if (bigFile) {
+      std::lock_guard<std::mutex> lk(resMu);
+      big.push_back(FileRec{c.full, e.alloc, lu, never});
+    }
+  }
+
+  // getattrlistbulk returns hundreds of entries with their metadata per syscall, instead of
+  // one fstatat per entry. Returns false if the file system doesn't support it.
+  bool bulkList(int dfd, DirCtx& c, std::vector<char>& buf) {
+    struct attrlist al;
+    memset(&al, 0, sizeof al);
+    al.bitmapcount = ATTR_BIT_MAP_COUNT;
+    al.commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | ATTR_CMN_CRTIME |
+                    ATTR_CMN_MODTIME | (opts.useAtime ? ATTR_CMN_ACCTIME : 0);
+    al.fileattr = ATTR_FILE_ALLOCSIZE;
+    bool first = true;
+    for (;;) {
+      int n = getattrlistbulk(dfd, &al, buf.data(), buf.size(), 0);
+      if (n < 0) {
+        if (first && (errno == ENOTSUP || errno == EINVAL)) return false;
+        errors.fetch_add(1);
+        return true;
+      }
+      if (n == 0) return true;
+      first = false;
+      const char* p = buf.data();
+      for (int i = 0; i < n; ++i) {
+        uint32_t len;
+        memcpy(&len, p, sizeof len);
+        const char* f = p + sizeof len;
+        attribute_set_t ret;
+        memcpy(&ret, f, sizeof ret);
+        f += sizeof ret;
+        Entry e{nullptr, false, 0, 0, 0, 0};
+        if (ret.commonattr & ATTR_CMN_NAME) {
+          attrreference_t r;
+          memcpy(&r, f, sizeof r);
+          e.name = f + r.attr_dataoffset;
+          f += sizeof r;
+        }
+        if (ret.commonattr & ATTR_CMN_OBJTYPE) {
+          fsobj_type_t t;
+          memcpy(&t, f, sizeof t);
+          e.isDir = t == VDIR;
+          f += sizeof t;
+        }
+        struct timespec t;
+        if (ret.commonattr & ATTR_CMN_CRTIME) { memcpy(&t, f, sizeof t); e.birth = ts(t); f += sizeof t; }
+        if (ret.commonattr & ATTR_CMN_MODTIME) { memcpy(&t, f, sizeof t); e.mtime = ts(t); f += sizeof t; }
+        if (ret.commonattr & ATTR_CMN_ACCTIME) { memcpy(&t, f, sizeof t); e.atime = ts(t); f += sizeof t; }
+        if (ret.fileattr & ATTR_FILE_ALLOCSIZE) {
+          off_t a;
+          memcpy(&a, f, sizeof a);
+          e.alloc = a > 0 ? static_cast<uint64_t>(a) : 0;
+          f += sizeof a;
+        }
+        p += len;
+        if (e.name) onEntry(c, e);
+      }
+    }
+  }
+
+  void readdirList(int dfd, DirCtx& c) {
+    DIR* dp = fdopendir(dup(dfd));
+    if (!dp) {
+      errors.fetch_add(1);
+      return;
+    }
+    struct stat st;
+    while (struct dirent* de = readdir(dp)) {
+      if (de->d_name[0] == '.' && (de->d_name[1] == 0 || (de->d_name[1] == '.' && de->d_name[2] == 0)))
+        continue;
+      if (fstatat(dirfd(dp), de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        errors.fetch_add(1);
+        continue;
+      }
+      Entry e{de->d_name, S_ISDIR(st.st_mode), static_cast<uint64_t>(st.st_blocks) * 512,
+              ts(st.st_mtimespec), ts(st.st_atimespec), ts(st.st_birthtimespec)};
+      onEntry(c, e);
+    }
+    closedir(dp);
+  }
+
+  // Directories are walked depth-first inside a worker (opening children relative to the
+  // parent fd avoids a full path lookup per directory); work is only handed to the shared
+  // queue when it runs low, so other threads stay busy.
+  void processDir(const WorkItem& w, int parentFd, int depth, std::vector<char>& buf) {
     DirNode node;
     node.path = w.path;
     node.parent = w.parent;
+    std::vector<WorkItem> subdirs;
+
+    const int oflags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+    int dfd = parentFd >= 0 ? openat(parentFd, w.name.c_str(), oflags) : open(w.path.c_str(), oflags);
+    struct stat st;
+    bool haveSt = dfd >= 0 && fstat(dfd, &st) == 0;
+    bool skip = w.id != 0 && (std::find(skipDirs.begin(), skipDirs.end(), w.path) != skipDirs.end() ||
+                              (haveSt && !devAllowed(st.st_dev)));
+    if (skip) {
+      // Another volume's mount point: leave a hole that the roll-up and the UI ignore.
+      if (dfd >= 0) close(dfd);
+      node.path.clear();
+      node.parent = -2;
+      storeNode(w.id, std::move(node));
+      return;
+    }
+
     node.category = w.id == 0 ? CAT_NONE : classifyDir(w.path, w.name, home);
     node.unit = node.category != CAT_NONE && node.category != CAT_DOWNLOADS;
     {
@@ -222,67 +385,64 @@ struct Walker {
       if (it != md.end()) node.mdLastUsed = it->second;
     }
 
-    std::vector<WorkItem> subdirs;
-    DIR* dp = opendir(w.path.c_str());
-    if (!dp) {
+    DirCtx c{w, node, subdirs, !md.empty() && mdDirs.count(w.path) > 0, {}, 0};
+    c.full.reserve(w.path.size() + 64);
+    if (dfd < 0) {
       errors.fetch_add(1);
     } else {
-      int dfd = dirfd(dp);
-      struct stat st;
       double dirMtime = 0;
-      if (fstat(dfd, &st) == 0) {
+      if (haveSt) {
         node.size += static_cast<uint64_t>(st.st_blocks) * 512;
-        dirMtime = st.st_mtimespec.tv_sec + st.st_mtimespec.tv_nsec * 1e-9;
+        dirMtime = ts(st.st_mtimespec);
       }
-      while (struct dirent* de = readdir(dp)) {
-        if (de->d_name[0] == '.' && (de->d_name[1] == 0 || (de->d_name[1] == '.' && de->d_name[2] == 0)))
-          continue;
-        if (fstatat(dfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-          errors.fetch_add(1);
-          continue;
-        }
-        std::string full = w.path;
-        if (full.empty() || full.back() != '/') full += '/';
-        full += de->d_name;
-        if (S_ISDIR(st.st_mode)) {
-          if (opts.sameDevice && st.st_dev != rootDev) continue;
-          subdirs.push_back(WorkItem{nextId.fetch_add(1), w.id, std::move(full), de->d_name});
-          continue;
-        }
-        uint64_t sz = static_cast<uint64_t>(st.st_blocks) * 512;
-        bool hasMd = false;
-        double lu = lastUsedOf(st, full, &hasMd);
-        double birth = st.st_birthtimespec.tv_sec + st.st_birthtimespec.tv_nsec * 1e-9;
-        double mt = st.st_mtimespec.tv_sec + st.st_mtimespec.tv_nsec * 1e-9;
-        bool never = !hasMd && std::fabs(mt - birth) < 60 && (now - birth) > 30 * 86400.0;
-        node.size += sz;
-        node.files += 1;
-        node.bucketSize[bucketFor(lu, now)] += sz;
-        if (never) node.neverOpenedSize += sz;
-        if (lu > node.lastUsed) node.lastUsed = lu;
-        uint64_t f = files.fetch_add(1) + 1;
-        if (opts.progressFiles && (f & 1023) == 0) opts.progressFiles->store(f, std::memory_order_relaxed);
-        if (sz >= opts.bigFileBytes) {
-          std::lock_guard<std::mutex> lk(resMu);
-          big.push_back(FileRec{full, sz, lu, never});
-        }
-      }
-      closedir(dp);
+      if (!bulkList(dfd, c, buf)) readdirList(dfd, c);
+      node.files = c.nfiles;
       if (node.files == 0 && subdirs.empty()) node.lastUsed = std::min(dirMtime, now);
+      if (c.nfiles) {
+        uint64_t f = files.fetch_add(c.nfiles, std::memory_order_relaxed) + c.nfiles;
+        if (opts.progressFiles && (f >> 12) != ((f - c.nfiles) >> 12))
+          opts.progressFiles->store(f, std::memory_order_relaxed);
+      }
     }
     if (node.mdLastUsed > node.lastUsed) node.lastUsed = node.mdLastUsed;
 
     node.children.reserve(subdirs.size());
     for (auto& s : subdirs) node.children.push_back(s.id);
-    {
-      std::lock_guard<std::mutex> lk(resMu);
-      if (nodes.size() <= static_cast<size_t>(w.id)) nodes.resize(w.id + 1024);
-      nodes[w.id] = std::move(node);
+    storeNode(w.id, std::move(node));
+    if (subdirs.empty()) {
+      if (dfd >= 0) close(dfd);
+      return;
     }
-    for (auto& s : subdirs) push(std::move(s));
+
+    size_t local = subdirs.size();
+    bool cancelled = opts.cancel && opts.cancel->load(std::memory_order_relaxed);
+    if (dfd < 0 || depth >= kMaxLocalDepth || cancelled) local = 0;
+    size_t shared = 0;
+    if (local == 0 || (subdirs.size() > 1 && queued.load(std::memory_order_relaxed) < lowWater)) {
+      std::lock_guard<std::mutex> lk(mu);
+      if (local == 0) shared = subdirs.size();
+      else if (queue.size() < lowWater) shared = std::min(subdirs.size() - 1, lowWater - queue.size());
+      if (shared) {
+        pending.fetch_add(static_cast<int64_t>(shared));
+        for (size_t i = subdirs.size() - shared; i < subdirs.size(); ++i) queue.push_back(std::move(subdirs[i]));
+        queued.store(queue.size(), std::memory_order_relaxed);
+      }
+    }
+    if (shared == 1) cv.notify_one();
+    else if (shared > 1) cv.notify_all();
+
+    for (size_t i = 0; i + shared < subdirs.size(); ++i) {
+      if (opts.cancel && opts.cancel->load(std::memory_order_relaxed)) break;
+      processDir(subdirs[i], dfd, depth + 1, buf);
+    }
+    if (dfd >= 0) close(dfd);
   }
 
+  static constexpr int kMaxLocalDepth = 48;  // bounds open fds held down one recursion chain
+  size_t lowWater = 16;
+
   void worker() {
+    std::vector<char> buf(256 * 1024);
     for (;;) {
       WorkItem w;
       {
@@ -291,15 +451,22 @@ struct Walker {
         if (queue.empty()) return;
         w = std::move(queue.back());
         queue.pop_back();
+        queued.store(queue.size(), std::memory_order_relaxed);
       }
       if (opts.cancel && opts.cancel->load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> lk(mu);
         pending.fetch_sub(static_cast<int64_t>(queue.size()));
         queue.clear();
+        queued.store(0, std::memory_order_relaxed);
       } else {
-        processDir(w);
+        processDir(w, -1, 0, buf);
       }
-      if (pending.fetch_sub(1) == 1) cv.notify_all();
+      if (pending.fetch_sub(1) == 1) {
+        // Taking the lock orders this after any waiter's predicate check, so the
+        // final wake-up can't slip between a check and the wait.
+        { std::lock_guard<std::mutex> lk(mu); }
+        cv.notify_all();
+      }
     }
   }
 };
@@ -324,7 +491,14 @@ ScanResult scan(const ScanOptions& opts) {
     res.errors = 1;
     return res;
   }
-  walker.rootDev = st.st_dev;
+  walker.allowedDevs.push_back(st.st_dev);
+  // The system snapshot and the data volume are one disk from the user's point of view.
+  struct stat sys, data;
+  if (::stat("/", &sys) == 0 && ::stat("/System/Volumes/Data", &data) == 0 &&
+      (st.st_dev == sys.st_dev || st.st_dev == data.st_dev)) {
+    walker.allowedDevs.push_back(sys.st_dev);
+    walker.allowedDevs.push_back(data.st_dev);
+  }
 
   std::string rootName = opts.root.substr(opts.root.find_last_of('/') + 1);
   walker.push(WorkItem{walker.nextId.fetch_add(1), -1, opts.root, rootName});
@@ -342,7 +516,7 @@ ScanResult scan(const ScanOptions& opts) {
   res.errors = walker.errors.load();
   if (opts.progressFiles) opts.progressFiles->store(res.files);
   for (auto& d : res.dirs)
-    if (d.path.empty() && &d != &res.dirs[0]) d.parent = -2;  // never processed (cancelled)
+    if (d.path.empty() && &d != &res.dirs[0]) d.parent = -2;  // never processed (cancelled) or skipped
 
   // Roll up children into parents. Children always have larger ids than parents.
   for (int32_t i = static_cast<int32_t>(res.dirs.size()) - 1; i > 0; --i) {
