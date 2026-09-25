@@ -27,7 +27,11 @@ std::unordered_map<std::string, double> spotlightLastUsed(const std::string& roo
       NSString* path = d[(__bridge NSString*)kMDItemPath];
       NSDate* used = d[(__bridge NSString*)kMDItemLastUsedDate];
       if (!path || !used) continue;
-      out[std::string(path.UTF8String)] = used.timeIntervalSince1970;
+      std::string p = path.UTF8String;
+      // Spotlight reports firmlink targets (/System/Volumes/Data/Users/...) for paths on the data volume.
+      static const std::string kDataVol = "/System/Volumes/Data/";
+      if (p.compare(0, kDataVol.size(), kDataVol) == 0) p.erase(0, kDataVol.size() - 1);
+      out[p] = used.timeIntervalSince1970;
     }
     CFRelease(query);
   }

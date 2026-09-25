@@ -443,7 +443,8 @@ int cmdApps(const Args& a) {
   int shown = 0;
   for (const App& x : apps) {
     if (shown++ >= a.top) { printf("  %s… %zu more (--top N)%s\n", DIM, apps.size() - a.top, RESET); break; }
-    printRow(human(x.size), x.launched, now, tilde(x.path), "installed/updated " + age(x.modified, now) + " ago");
+    std::string when = age(x.modified, now);
+    printRow(human(x.size), x.launched, now, tilde(x.path), "installed/updated " + (when == "today" ? when : when + " ago"));
   }
   printf("\n");
   return 0;
