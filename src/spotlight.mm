@@ -22,13 +22,15 @@ std::unordered_map<std::string, double> spotlightLastUsed(const std::string& roo
     }
     CFIndex n = MDQueryGetResultCount(query);
     out.reserve(static_cast<size_t>(n));
-    NSArray* attrs = @[ (__bridge NSString*)kMDItemPath, (__bridge NSString*)kMDItemLastUsedDate ];
+    NSString* pathKey = @"kMDItemPath";
+    NSString* usedKey = @"kMDItemLastUsedDate";
+    NSArray* attrs = @[ pathKey, usedKey ];
     for (CFIndex i = 0; i < n; ++i) {
       MDItemRef item = (MDItemRef)MDQueryGetResultAtIndex(query, i);
       if (!item) continue;
       NSDictionary* d = CFBridgingRelease(MDItemCopyAttributes(item, (__bridge CFArrayRef)attrs));
-      NSString* path = d[(__bridge NSString*)kMDItemPath];
-      NSDate* used = d[(__bridge NSString*)kMDItemLastUsedDate];
+      NSString* path = d[pathKey];
+      NSDate* used = d[usedKey];
       if (!path || !used) continue;
       std::string p = path.UTF8String;
       // Spotlight reports firmlink targets (/System/Volumes/Data/Users/...) for paths on the data volume.
