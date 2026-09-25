@@ -206,8 +206,11 @@ void collectForgotten(const ScanResult& r, int32_t id, std::vector<int32_t>& out
   const DirNode& d = r.dirs[id];
   if (d.size < minBytes) return;
   if (id != 0 && d.unit && categoryReclaimable(d.category)) return;
-  uint64_t old = d.bucketSize[STALE] + d.bucketSize[FROZEN];
-  if (id != 0 && d.size > 0 && old * 10 >= d.size * 9 && bucketFor(d.lastUsed, r.now) >= STALE) {
+  // Judge only the non-regenerable content; reclaimable units are reported separately.
+  uint64_t own = d.size - d.reclaimableSize;
+  uint64_t old = d.bucketSize[STALE] + d.bucketSize[FROZEN] - d.reclaimableBucketSize[STALE] -
+                 d.reclaimableBucketSize[FROZEN];
+  if (id != 0 && own >= minBytes && old * 10 >= own * 9 && bucketFor(d.lastUsed, r.now) >= STALE) {
     out.push_back(id);
     return;
   }

@@ -49,6 +49,8 @@ struct DirNode {
   uint64_t files = 0;      // recursive file count
   uint64_t bucketSize[NBUCKETS] = {0, 0, 0, 0, 0};
   uint64_t neverOpenedSize = 0;
+  uint64_t reclaimableSize = 0;  // bytes inside reclaimable unit descendants
+  uint64_t reclaimableBucketSize[NBUCKETS] = {0, 0, 0, 0, 0};
   double lastUsed = 0;     // newest lastUsed among descendants (and itself)
   double mdLastUsed = 0;   // Spotlight last-opened for the directory itself
   std::vector<int32_t> children;

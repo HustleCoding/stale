@@ -343,6 +343,13 @@ ScanResult scan(const ScanOptions& opts) {
     p.files += c.files;
     for (int b = 0; b < NBUCKETS; ++b) p.bucketSize[b] += c.bucketSize[b];
     p.neverOpenedSize += c.neverOpenedSize;
+    if (c.unit && categoryReclaimable(c.category)) {
+      p.reclaimableSize += c.size;
+      for (int b = 0; b < NBUCKETS; ++b) p.reclaimableBucketSize[b] += c.bucketSize[b];
+    } else {
+      p.reclaimableSize += c.reclaimableSize;
+      for (int b = 0; b < NBUCKETS; ++b) p.reclaimableBucketSize[b] += c.reclaimableBucketSize[b];
+    }
     if (c.lastUsed > p.lastUsed) p.lastUsed = c.lastUsed;
   }
   // A directory with nothing inside inherits its own mtime as "used".
