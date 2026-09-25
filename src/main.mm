@@ -287,7 +287,7 @@ int cmdReport(const Args& a) {
 
   printf("%sWhen did you last use it?%s  %s(by size; last used = max(last opened, modified))%s\n",
          BOLD, RESET, DIM, RESET);
-  const char* labels[NBUCKETS] = {"this week", "this month", "< 6 months", "6–12 months", "> 1 year"};
+  const char* labels[NBUCKETS] = {"this week", "this month", "< 6 months", "6-12 months", "> 1 year"};
   for (int b = 0; b < NBUCKETS; ++b) {
     double frac = root.size ? static_cast<double>(root.bucketSize[b]) / root.size : 0;
     printf("  %s%-7s%s %-12s %s%s%s %s %3.0f%%\n", bucketColor(static_cast<Bucket>(b)), kBucketNames[b],

@@ -15,7 +15,7 @@ When did you last use it?  (by size; last used = max(last opened, modified))
   hot     this week    ████░░░░░░░░░░░░░░░░░░░░░░░░░░   7.8G  14%
   warm    this month   ██████░░░░░░░░░░░░░░░░░░░░░░░░  11.2G  20%
   cold    < 6 months   ███████░░░░░░░░░░░░░░░░░░░░░░░  13.1G  23%
-  stale   6–12 months  ███░░░░░░░░░░░░░░░░░░░░░░░░░░░   6.0G  11%
+  stale   6-12 months  ███░░░░░░░░░░░░░░░░░░░░░░░░░░░   6.0G  11%
   frozen  > 1 year     ██████████░░░░░░░░░░░░░░░░░░░░  18.9G  33%
   never                 14.4G (created, never opened or modified since)
 
