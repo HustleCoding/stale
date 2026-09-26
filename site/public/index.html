@@ -29,7 +29,7 @@
   .small { font-size:14px; color:var(--muted); }
   .small code { font:13px ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--line); padding:3px 8px; border-radius:6px; user-select:all; overflow-wrap:anywhere; }
   .shot { margin:24px auto 0; }
-  .shot img { width:100%; height:auto; display:block; }
+  .shot video { width:100%; height:auto; aspect-ratio:1600/1060; display:block; border-radius:12px; border:1px solid var(--line); box-shadow:0 2px 6px rgba(0,0,0,.08), 0 40px 80px -30px rgba(0,0,0,.35); background:var(--card); }
   .features { padding:112px 0 96px; }
   .features > .head { text-align:center; max-width:640px; margin:0 auto 48px; }
   .eyebrow { font-size:14px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--accent); }
@@ -75,7 +75,7 @@
     </div>
   </header>
 
-  <div class="shot"><img src="/screenshot.png" alt="Stale showing a Mac's disk usage by last use" width="1712" height="1200"></div>
+  <div class="shot"><video src="/demo.mp4" poster="/demo-poster.jpg" width="1600" height="1060" autoplay muted loop playsinline aria-label="Stale showing a Mac's disk usage by last use, then its AI agents, Safe to delete and Apps sections"></video></div>
 
   <section class="features">
     <div class="head">
