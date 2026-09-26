@@ -88,10 +88,14 @@ void measure(const std::string& path, const FinderOptions& o, Found& out) {
   }
 }
 
-std::vector<std::string> listDir(const std::string& path, bool hidden = false) {
+// denied is set when macOS refused the listing (TCC-protected folder without Full Disk Access).
+std::vector<std::string> listDir(const std::string& path, bool hidden = false, bool* denied = nullptr) {
   std::vector<std::string> out;
   DIR* dp = opendir(path.c_str());
-  if (!dp) return out;
+  if (!dp) {
+    if (denied) *denied = errno == EPERM || errno == EACCES;
+    return out;
+  }
   while (dirent* e = readdir(dp)) {
     if (e->d_name[0] == '.' && (!hidden || !e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]))) continue;
     out.emplace_back(e->d_name);
@@ -496,7 +500,7 @@ FinderResult findOldDownloads(const FinderOptions& o, double olderThanDays) {
   static const std::unordered_set<std::string> installers = {"dmg", "pkg", "mpkg", "xip"};
   static const std::unordered_set<std::string> archives = {"zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "iso"};
   static const std::unordered_set<std::string> partial = {"download", "crdownload", "part", "tmp", "aria2"};
-  for (const std::string& name : listDir(dir)) {
+  for (const std::string& name : listDir(dir, false, &res.unreadable)) {
     if (cancelled(o)) return res;
     size_t dot = name.find_last_of('.');
     std::string ext = dot == std::string::npos ? "" : lower(name.substr(dot + 1));
@@ -534,7 +538,7 @@ FinderResult findOldDownloads(const FinderOptions& o, double olderThanDays) {
 FinderResult findTrash(const FinderOptions& o) {
   FinderResult res;
   std::string dir = o.home + "/.Trash";
-  for (const std::string& name : listDir(dir, true)) {
+  for (const std::string& name : listDir(dir, true, &res.unreadable)) {
     if (cancelled(o)) return res;
     if (name == ".DS_Store") continue;
     Found f;

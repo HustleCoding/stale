@@ -780,6 +780,7 @@ struct RingSeg {
   // Finder pages: results are computed on first visit and kept until the index changes.
   NSMutableArray<Item*>* _finderItems[(int)Mode::Count];
   BOOL _finderRunning[(int)Mode::Count];
+  BOOL _finderUnreadable[(int)Mode::Count];  // the folder is TCC-protected; the empty list means nothing
   int _finderGeneration;
   std::shared_ptr<std::atomic<bool>> _finderCancel;
   std::shared_ptr<std::atomic<uint64_t>> _finderProgress;
@@ -1448,7 +1449,7 @@ struct RingSeg {
   if (a == @selector(revealSelected:) || a == @selector(copyPath:) || a == @selector(openSelected:) ||
       a == @selector(togglePreview:))
     return [self selectedItems].count > 0;
-  if (a == @selector(emptyTrash:)) return !_scanning && !_loading;
+  if (a == @selector(emptyTrash:)) return !_scanning && !_loading && !_finderUnreadable[(int)Mode::Trash];
   if (a == @selector(modeFromMenu:)) item.state = item.tag == (NSInteger)_mode ? NSControlStateValueOn : NSControlStateValueOff;
   if (a == @selector(cancelScan:)) return _scanning;
   if (a == @selector(rescan:) || a == @selector(chooseFolder:) || a == @selector(openHome:) || a == @selector(openDisk:))
@@ -2308,6 +2309,8 @@ struct RingSeg {
 }
 
 - (void)showMode:(Mode)m {
+  // Coming back to a page whose folder was protected: access may have been granted since, look again.
+  if (_mode != m && isFinderMode(m) && _finderUnreadable[(int)m]) _finderItems[(int)m] = nil;
   _mode = m;
   [self syncSidebar];
   const ModeInfo& mi = kModes[(int)m];
@@ -2370,7 +2373,12 @@ struct RingSeg {
   if (!empty) [_window makeFirstResponder:_outline];
   _bottom.hidden = empty;
   _empty.hidden = !empty;
-  if (empty) {
+  if (empty && isFinderMode(m) && _finderUnreadable[(int)m]) {
+    _emptyIcon.image = symbol(@"lock.shield", 40, NSFontWeightLight);
+    _emptyTitle.stringValue = [NSString stringWithFormat:@"Stale isn't allowed to see %@",
+                                                         m == Mode::Trash ? @"the Trash" : @"your Downloads"];
+    _emptyHint.stringValue = @"Give Stale Full Disk Access in System Settings › Privacy & Security, then open this page again.";
+  } else if (empty) {
     _emptyIcon.image = symbol(m == Mode::Browse ? @"folder" : @"checkmark.circle", 40, NSFontWeightLight);
     _emptyTitle.stringValue = mi.emptyTitle;
     _emptyHint.stringValue = mi.emptyHint;
@@ -2456,6 +2464,7 @@ struct RingSeg {
         [items addObject:it];
       }
       self->_finderItems[(int)m] = items;
+      self->_finderUnreadable[(int)m] = out->unreadable;
       [self refreshFinderBadge:m];
       if (self->_mode == m) [self showMode:m];
     });
@@ -2466,7 +2475,8 @@ struct RingSeg {
   uint64_t bytes = 0;
   for (Item* it in _finderItems[(int)m]) bytes += m == Mode::Trash || it.suggested ? it.size : 0;
   for (SidebarEntry* e in _entries)
-    if (!e.isGroup && e.mode == m) e.badge = _finderItems[(int)m] && (bytes || _finderItems[(int)m].count == 0) ? fmtBytes(bytes) : nil;
+    if (!e.isGroup && e.mode == m)
+      e.badge = _finderItems[(int)m] && !_finderUnreadable[(int)m] && (bytes || _finderItems[(int)m].count == 0) ? fmtBytes(bytes) : nil;
   [self reloadSidebarBadges];
 }
 
@@ -2817,7 +2827,7 @@ struct RingSeg {
   if (_mode == Mode::Trash) {
     uint64_t all = 0;
     for (Item* it in _flat) all += it.size;
-    _emptyTrashButton.enabled = _flat.count > 0;
+    _emptyTrashButton.enabled = _flat.count > 0 && !_finderUnreadable[(int)Mode::Trash];
     _status.stringValue = any ? [NSString stringWithFormat:@"%@ selected  ·  %@  ·  %@ in the Trash altogether", fmtCount(sel.count, @"item"), fmtBytes(total), fmtBytes(all)]
                               : [NSString stringWithFormat:@"%@ in %@. Emptying deletes them for good.", fmtBytes(all), fmtCount(_flat.count, @"item")];
   } else if (!any) {
@@ -2906,7 +2916,17 @@ struct RingSeg {
   NSString* trashDir = [NSHomeDirectory() stringByAppendingPathComponent:@".Trash"];
   if (!items) {
     NSMutableArray<Item*>* found = [NSMutableArray new];
-    for (NSString* n in [NSFileManager.defaultManager contentsOfDirectoryAtPath:trashDir error:nil]) {
+    NSError* listErr = nil;
+    NSArray<NSString*>* names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:trashDir error:&listErr];
+    if (!names && listErr) {
+      NSAlert* a = [NSAlert new];
+      a.messageText = @"Stale isn't allowed to see the Trash";
+      a.informativeText = @"Give Stale Full Disk Access in System Settings › Privacy & Security, then try again.";
+      [a addButtonWithTitle:@"OK"];
+      [a beginSheetModalForWindow:_window completionHandler:nil];
+      return;
+    }
+    for (NSString* n in names) {
       if ([n isEqual:@".DS_Store"]) continue;
       Item* it = [Item new];
       it.path = [trashDir stringByAppendingPathComponent:n];

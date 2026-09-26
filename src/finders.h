@@ -26,6 +26,7 @@ struct FinderResult {
   std::vector<Found> items;
   uint64_t suggested = 0;  // bytes of the preselected items
   uint64_t total = 0;      // bytes of everything listed
+  bool unreadable = false;  // the folder searched is protected (needs Full Disk Access), so nothing can be said
 };
 
 struct FinderOptions {
