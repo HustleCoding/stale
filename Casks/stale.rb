@@ -4,7 +4,7 @@ cask "stale" do
 
   url "https://stale.f-dobinciuc7.workers.dev/download"
   name "Stale"
-  desc "Shows what you use on your Mac and what you can delete"
+  desc "Shows which files you use and which you can delete"
   homepage "https://stale.f-dobinciuc7.workers.dev/"
 
   depends_on macos: :monterey
