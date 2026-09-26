@@ -1845,7 +1845,7 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
     return;
   }
   _root = [self itemForDir:0 parent:nil];
-  _fdaBanner.hidden = r.errors < 20;
+  _fdaBanner.hidden = r.errors < 20 || hasFullDiskAccess();
   _appItems = nil;
   [self dropFinderResults:YES];
   [self refreshSummary];
@@ -1982,7 +1982,7 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
 // while keeping expansion, selection and scroll position.
 - (void)modelChanged:(const std::unordered_set<int32_t>&)touched {
   const ScanResult& r = *_model.result;
-  _fdaBanner.hidden = r.errors < 20;
+  _fdaBanner.hidden = r.errors < 20 || hasFullDiskAccess();
   _appItems = nil;
   if (!isFinderMode(_mode) || !_finderRunning[(int)_mode]) [self dropFinderResults:NO];
   NSMutableSet<NSString*>* selected = [NSMutableSet new];
