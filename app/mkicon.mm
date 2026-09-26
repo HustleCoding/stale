@@ -2,9 +2,8 @@
 // .icns is then produced with iconutil.
 //   mkicon <out.iconset> [preview.png]
 //
-// Design: a "sediment core" — a glossy disk whose five strata are the recency
-// buckets (fresh mint on top, sinking through teal, blue and amber to a thin rose
-// layer at the bottom), set into a deep indigo squircle.
+// Design: a stack of glass cards on an indigo squircle: a fresh mint card with a
+// clock in front of a recent blue one and a faded, dusty one at the back.
 #import <Cocoa/Cocoa.h>
 
 static NSColor* hex(uint32_t v, CGFloat a = 1) {
@@ -14,129 +13,118 @@ static NSColor* hex(uint32_t v, CGFloat a = 1) {
                              alpha:a];
 }
 
+static NSShadow* makeShadow(CGFloat alpha, CGFloat blur, CGFloat dy) {
+  NSShadow* sh = [NSShadow new];
+  sh.shadowColor = [NSColor colorWithWhite:0 alpha:alpha];
+  sh.shadowBlurRadius = blur;
+  sh.shadowOffset = NSMakeSize(0, dy);
+  return sh;
+}
+
+static void radialGlow(NSRect tile, CGFloat fx, CGFloat fy, CGFloat r, NSColor* color) {
+  NSPoint p = NSMakePoint(NSMinX(tile) + tile.size.width * fx, NSMinY(tile) + tile.size.height * fy);
+  NSGradient* g = [[NSGradient alloc] initWithStartingColor:color endingColor:[color colorWithAlphaComponent:0]];
+  [g drawFromCenter:p radius:0 toCenter:p radius:tile.size.width * r options:0];
+}
+
 static void draw(CGFloat s) {
   // Apple's template: the squircle fills 824/1024 of the canvas.
   CGFloat inset = s * (100.0 / 1024.0);
   NSRect tile = NSMakeRect(inset, inset, s - 2 * inset, s - 2 * inset);
-  CGFloat radius = tile.size.width * 0.2237;
+  CGFloat W = tile.size.width;
+  CGFloat radius = W * 0.2237;
   NSBezierPath* squircle = [NSBezierPath bezierPathWithRoundedRect:tile xRadius:radius yRadius:radius];
 
-  // Drop shadow + base fill.
-  NSShadow* shadow = [NSShadow new];
-  shadow.shadowColor = [NSColor colorWithWhite:0 alpha:0.30];
-  shadow.shadowBlurRadius = s * 0.022;
-  shadow.shadowOffset = NSMakeSize(0, -s * 0.012);
   [NSGraphicsContext saveGraphicsState];
-  [shadow set];
-  [hex(0x12142E) setFill];
+  [makeShadow(0.30, s * 0.022, -s * 0.012) set];
+  [hex(0x1E1B4B) setFill];
   [squircle fill];
   [NSGraphicsContext restoreGraphicsState];
 
   [NSGraphicsContext saveGraphicsState];
   [squircle addClip];
-  NSGradient* bg = [[NSGradient alloc] initWithColorsAndLocations:hex(0x3A3F8F), 0.0, hex(0x1E2158), 0.55,
-                                                                  hex(0x0B0D22), 1.0, nil];
+  NSGradient* bg = [[NSGradient alloc] initWithColorsAndLocations:hex(0x5B54F0), 0.0, hex(0x3730A3), 0.5,
+                                                                  hex(0x1A1745), 1.0, nil];
   [bg drawInRect:tile angle:-90];
-
-  // Cool radial glow in the upper left, warm one bottom right: gives the slab depth.
-  NSGradient* glow1 = [[NSGradient alloc] initWithStartingColor:hex(0x7C83FF, 0.55) endingColor:hex(0x7C83FF, 0)];
-  [glow1 drawFromCenter:NSMakePoint(NSMinX(tile) + tile.size.width * 0.22, NSMaxY(tile) - tile.size.height * 0.18)
-                 radius:0
-               toCenter:NSMakePoint(NSMinX(tile) + tile.size.width * 0.22, NSMaxY(tile) - tile.size.height * 0.18)
-                 radius:tile.size.width * 0.75
-                options:0];
-  NSGradient* glow2 = [[NSGradient alloc] initWithStartingColor:hex(0xF43F5E, 0.22) endingColor:hex(0xF43F5E, 0)];
-  [glow2 drawFromCenter:NSMakePoint(NSMaxX(tile) - tile.size.width * 0.15, NSMinY(tile) + tile.size.height * 0.12)
-                 radius:0
-               toCenter:NSMakePoint(NSMaxX(tile) - tile.size.width * 0.15, NSMinY(tile) + tile.size.height * 0.12)
-                 radius:tile.size.width * 0.6
-                options:0];
-
-  // Hairline rim so the slab reads as an object on light and dark docks.
+  radialGlow(tile, 0.20, 0.88, 0.70, hex(0xA5B4FC, 0.45));
+  radialGlow(tile, 0.85, 0.10, 0.60, hex(0x2DD4BF, 0.20));
   NSBezierPath* rim = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(tile, s * 0.004, s * 0.004)
                                                       xRadius:radius - s * 0.004
                                                       yRadius:radius - s * 0.004];
   rim.lineWidth = s * 0.006;
-  [[NSColor colorWithWhite:1 alpha:0.14] setStroke];
+  [[NSColor colorWithWhite:1 alpha:0.18] setStroke];
   [rim stroke];
   [NSGraphicsContext restoreGraphicsState];
 
-  // The disk.
-  CGFloat R = tile.size.width * 0.36;
-  NSPoint c = NSMakePoint(NSMidX(tile), NSMidY(tile) + tile.size.height * 0.01);
-  NSRect diskRect = NSMakeRect(c.x - R, c.y - R, 2 * R, 2 * R);
-  NSBezierPath* disk = [NSBezierPath bezierPathWithOvalInRect:diskRect];
-
-  NSShadow* diskShadow = [NSShadow new];
-  diskShadow.shadowColor = [NSColor colorWithWhite:0 alpha:0.45];
-  diskShadow.shadowBlurRadius = s * 0.035;
-  diskShadow.shadowOffset = NSMakeSize(0, -s * 0.02);
-  [NSGraphicsContext saveGraphicsState];
-  [diskShadow set];
-  [hex(0x0B0D22) setFill];
-  [disk fill];
-  [NSGraphicsContext restoreGraphicsState];
-
-  // Strata: thick fresh layers on top, thinning towards the old rose at the bottom.
-  struct Stratum { CGFloat share; uint32_t top, bottom; };
-  const Stratum strata[] = {
-      {0.30, 0x6EE7B7, 0x22C55E},  // this week
-      {0.25, 0x5EEAD4, 0x14B8A6},  // this month
-      {0.20, 0x93C5FD, 0x3B82F6},  // 6 months
-      {0.15, 0xFCD34D, 0xF59E0B},  // a year
-      {0.10, 0xFDA4AF, 0xF43F5E},  // older
+  // Three cards, back to front: the old, dusty layer; the recent blue one; the fresh
+  // card you are using now, with a clock.
+  struct Card { CGFloat dy, scale, alpha; uint32_t top, bottom; };
+  const Card cards[] = {
+      {0.215, 0.76, 0.55, 0xA8A3C7, 0x6E6A96},
+      {0.110, 0.88, 0.85, 0x93C5FD, 0x4F7FF0},
+      {-0.030, 1.00, 1.00, 0x7CF0C5, 0x14B8A6},
   };
-  [NSGraphicsContext saveGraphicsState];
-  [disk addClip];
-  CGFloat y = NSMaxY(diskRect);
-  for (const Stratum& st : strata) {
-    CGFloat h = diskRect.size.height * st.share;
-    NSRect r = NSMakeRect(diskRect.origin.x, y - h, diskRect.size.width, h);
-    NSGradient* g = [[NSGradient alloc] initWithStartingColor:hex(st.top) endingColor:hex(st.bottom)];
+  NSPoint c = NSMakePoint(NSMidX(tile), NSMidY(tile) - W * 0.035);
+  for (const Card& k : cards) {
+    CGFloat cw = W * 0.62 * k.scale, ch = W * 0.42 * k.scale, cr = W * 0.075 * k.scale;
+    NSRect r = NSMakeRect(c.x - cw / 2, c.y - ch / 2 + W * k.dy, cw, ch);
+    NSBezierPath* p = [NSBezierPath bezierPathWithRoundedRect:r xRadius:cr yRadius:cr];
+
+    [NSGraphicsContext saveGraphicsState];
+    [makeShadow(0.38, s * 0.035, -s * 0.016) set];
+    [hex(k.bottom) setFill];
+    [p fill];
+    [NSGraphicsContext restoreGraphicsState];
+
+    [NSGraphicsContext saveGraphicsState];
+    [p addClip];
+    NSGradient* g = [[NSGradient alloc] initWithStartingColor:hex(k.top) endingColor:hex(k.bottom)];
     [g drawInRect:r angle:-90];
-    // Thin dark seam between layers.
-    NSRect seam = NSMakeRect(r.origin.x, r.origin.y - s * 0.002, r.size.width, s * 0.004);
-    [[NSColor colorWithWhite:0 alpha:0.22] setFill];
-    NSRectFillUsingOperation(seam, NSCompositingOperationSourceOver);
-    y -= h;
+    // Frosted veil on the back cards so they recede.
+    [[NSColor colorWithSRGBRed:0.16 green:0.14 blue:0.40 alpha:1 - k.alpha] setFill];
+    NSRectFillUsingOperation(r, NSCompositingOperationSourceOver);
+    // Glass sheen across the top of every card.
+    NSGradient* sheen = [[NSGradient alloc] initWithColorsAndLocations:[NSColor colorWithWhite:1 alpha:0.38], 0.0,
+                                                                       [NSColor colorWithWhite:1 alpha:0.06], 0.45,
+                                                                       [NSColor colorWithWhite:1 alpha:0], 1.0, nil];
+    [sheen drawInRect:r angle:-90];
+    [NSGraphicsContext restoreGraphicsState];
+
+    NSBezierPath* edge = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(r, s * 0.002, s * 0.002)
+                                                         xRadius:cr
+                                                         yRadius:cr];
+    edge.lineWidth = s * 0.004;
+    [[NSColor colorWithWhite:1 alpha:0.45 * k.alpha] setStroke];
+    [edge stroke];
+
+    if (k.alpha < 1) continue;
+    CGFloat d = ch * 0.50;
+    NSPoint cc = NSMakePoint(NSMinX(r) + ch * 0.44, NSMidY(r));
+    [NSGraphicsContext saveGraphicsState];
+    [makeShadow(0.18, s * 0.012, -s * 0.004) set];
+    [[NSColor colorWithWhite:1 alpha:0.97] setFill];
+    [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(cc.x - d / 2, cc.y - d / 2, d, d)] fill];
+    [NSGraphicsContext restoreGraphicsState];
+    NSBezierPath* hands = [NSBezierPath bezierPath];
+    [hands moveToPoint:NSMakePoint(cc.x, cc.y + d * 0.27)];
+    [hands lineToPoint:cc];
+    [hands lineToPoint:NSMakePoint(cc.x + d * 0.20, cc.y - d * 0.10)];
+    hands.lineWidth = d * 0.10;
+    hands.lineCapStyle = NSLineCapStyleRound;
+    hands.lineJoinStyle = NSLineJoinStyleRound;
+    [hex(0x0F766E) setStroke];
+    [hands stroke];
+
+    CGFloat barH = d * 0.20, barX = cc.x + d * 0.78;
+    CGFloat lengths[] = {NSMaxX(r) - barX - ch * 0.22, (NSMaxX(r) - barX - ch * 0.22) * 0.62};
+    CGFloat ys[] = {NSMidY(r) + d * 0.06, NSMidY(r) - d * 0.30};
+    CGFloat alphas[] = {0.95, 0.60};
+    for (int i = 0; i < 2; i++) {
+      NSRect bar = NSMakeRect(barX, ys[i], lengths[i], barH);
+      [[NSColor colorWithWhite:1 alpha:alphas[i]] setFill];
+      [[NSBezierPath bezierPathWithRoundedRect:bar xRadius:barH / 2 yRadius:barH / 2] fill];
+    }
   }
-
-  // Curvature: darken the disk edges and the bottom, lighten the top.
-  NSGradient* shade = [[NSGradient alloc] initWithColorsAndLocations:[NSColor colorWithWhite:0 alpha:0], 0.0,
-                                                                     [NSColor colorWithWhite:0 alpha:0], 0.62,
-                                                                     [NSColor colorWithWhite:0 alpha:0.42], 1.0, nil];
-  [shade drawFromCenter:c radius:0 toCenter:c radius:R options:NSGradientDrawsAfterEndingLocation];
-  NSGradient* bottomShade = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithWhite:0 alpha:0.30]
-                                                          endingColor:[NSColor colorWithWhite:0 alpha:0]];
-  [bottomShade drawInRect:NSMakeRect(diskRect.origin.x, diskRect.origin.y, diskRect.size.width, R * 0.7) angle:90];
-
-  // Gloss: a soft elliptical highlight across the upper half.
-  NSRect glossRect = NSMakeRect(c.x - R * 0.86, c.y + R * 0.06, R * 1.72, R * 0.86);
-  NSBezierPath* gloss = [NSBezierPath bezierPathWithOvalInRect:glossRect];
-  NSGradient* glossG = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithWhite:1 alpha:0.34]
-                                                     endingColor:[NSColor colorWithWhite:1 alpha:0.02]];
-  [glossG drawInBezierPath:gloss angle:90];
-  [NSGraphicsContext restoreGraphicsState];
-
-  // Bevel ring on the disk edge.
-  NSBezierPath* edge = [NSBezierPath bezierPathWithOvalInRect:NSInsetRect(diskRect, s * 0.003, s * 0.003)];
-  edge.lineWidth = s * 0.006;
-  [[NSColor colorWithWhite:1 alpha:0.30] setStroke];
-  [edge stroke];
-
-  // A small "now" tick at 12 o'clock — a nod to the clock in the app.
-  CGFloat tickW = R * 0.11, tickH = R * 0.26;
-  NSRect tick = NSMakeRect(c.x - tickW / 2, c.y + R - tickH - R * 0.10, tickW, tickH);
-  NSBezierPath* tickP = [NSBezierPath bezierPathWithRoundedRect:tick xRadius:tickW / 2 yRadius:tickW / 2];
-  [NSGraphicsContext saveGraphicsState];
-  NSShadow* ts = [NSShadow new];
-  ts.shadowColor = [NSColor colorWithWhite:0 alpha:0.35];
-  ts.shadowBlurRadius = s * 0.008;
-  ts.shadowOffset = NSMakeSize(0, -s * 0.003);
-  [ts set];
-  [[NSColor colorWithWhite:1 alpha:0.92] setFill];
-  [tickP fill];
-  [NSGraphicsContext restoreGraphicsState];
 }
 
 static BOOL writePNG(CGFloat px, NSString* path) {
