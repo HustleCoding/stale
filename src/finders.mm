@@ -533,6 +533,152 @@ FinderResult findOldDownloads(const FinderOptions& o, double olderThanDays) {
   return res;
 }
 
+// ───────────────────────────── AI agents ─────────────────────────────
+
+namespace {
+
+std::string gitBinary() {
+  // /usr/bin/git is a stub that asks to install the developer tools, so only use a real one.
+  static const char* candidates[] = {"/Library/Developer/CommandLineTools/usr/bin/git",
+                                     "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+                                     "/opt/homebrew/bin/git", "/usr/local/bin/git"};
+  for (const char* c : candidates)
+    if (access(c, X_OK) == 0) return c;
+  return "";
+}
+
+// Runs git in dir; returns false when it could not run or exited non-zero.
+bool runGit(const std::string& git, const std::string& dir, NSArray<NSString*>* args, std::string& out) {
+  @autoreleasepool {
+    NSTask* t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:ns(git)];
+    t.arguments = [@[ @"-C", ns(dir) ] arrayByAddingObjectsFromArray:args];
+    t.environment = @{@"GIT_OPTIONAL_LOCKS" : @"0", @"PATH" : @"/usr/bin:/bin"};
+    NSPipe* pipe = [NSPipe pipe];
+    t.standardOutput = pipe;
+    t.standardError = [NSFileHandle fileHandleWithNullDevice];
+    if (![t launchAndReturnError:nil]) return false;
+    NSData* d = [pipe.fileHandleForReading readDataToEndOfFile];
+    [t waitUntilExit];
+    out.assign((const char*)d.bytes, d.length);
+    return t.terminationStatus == 0;
+  }
+}
+
+// "" when the worktree can go, otherwise why it should stay.
+std::string worktreeKeepReason(const std::string& git, const std::string& dir) {
+  if (git.empty()) return "Git isn't installed, so Stale can't check it for unsaved work";
+  std::string out;
+  if (!runGit(git, dir, @[ @"status", @"--porcelain" ], out)) return "Git can't read it; check it yourself";
+  if (!out.empty()) return "Has uncommitted changes";
+  if (!runGit(git, dir, @[ @"for-each-ref", @"--contains", @"HEAD", @"--count=1", @"refs/heads", @"refs/remotes" ], out))
+    return "Git can't read it; check it yourself";
+  if (out.empty()) return "Has commits that aren't on any branch";
+  return "";
+}
+
+}  // namespace
+
+FinderResult findAgentFiles(const FinderOptions& o) {
+  FinderResult res;
+  Installed apps(o.home);
+  const std::string& h = o.home;
+  const std::string support = h + "/Library/Application Support/";
+  const double day = 86400;
+  const std::string git = gitBinary();
+  std::unordered_set<std::string> seen;
+
+  auto add = [&](const std::string& path, const std::string& what, bool preselect, double minAgeDays = 0) {
+    if (cancelled(o) || seen.count(path)) return;
+    Found f;
+    f.path = path;
+    measure(path, o, f);
+    if (f.size < (1ull << 20)) return;
+    if (minAgeDays > 0 && o.now - f.lastUsed < minAgeDays * day) return;
+    seen.insert(path);
+    f.preselect = preselect;
+    f.note = what;
+    res.items.push_back(std::move(f));
+  };
+
+  auto worktree = [&](const std::string& path, const std::string& tool) {
+    if (cancelled(o) || seen.count(path)) return;
+    Found f;
+    f.path = path;
+    measure(path, o, f);
+    if (!f.isDir || f.size == 0) return;
+    seen.insert(path);
+    std::string age = "used " + fmtAgoDays(f.lastUsed, o.now);
+    if (o.now - f.lastUsed < 14 * day) {
+      f.note = tool + " worktree, " + age;
+    } else {
+      std::string keep = worktreeKeepReason(git, path);
+      f.preselect = keep.empty();
+      f.note = tool + " worktree, " + age + (keep.empty() ? ", no unsaved work" : ". " + keep);
+    }
+    res.items.push_back(std::move(f));
+  };
+
+  // Worktrees. Codex: worktrees/<id>/<repo>; Cursor: worktrees/<repo>/<name>; Conductor:
+  // workspaces/<repo>/<name>; Claude Code: <repo>/.claude/worktrees/<name>, anywhere on disk.
+  auto twoLevels = [&](const std::string& root, const std::string& tool) {
+    for (const std::string& a : listDir(root))
+      for (const std::string& b : listDir(root + "/" + a)) worktree(root + "/" + a + "/" + b, tool);
+  };
+  twoLevels(h + "/.codex/worktrees", "Codex");
+  twoLevels(h + "/.cursor/worktrees", "Cursor");
+  twoLevels(h + "/conductor/workspaces", "Conductor");
+  if (o.index)
+    for (const DirNode& d : o.index->dirs) {
+      if (cancelled(o)) return res;
+      if (hasSuffix(d.path, "/.claude/worktrees"))
+        for (const std::string& n : listDir(d.path)) worktree(d.path + "/" + n, "Claude Code");
+    }
+
+  // Agent apps that are no longer installed: everything but their worktrees.
+  struct App { const char* id; const char* name; std::vector<std::string> paths; };
+  const App gone[] = {
+      {"com.exafunction.windsurf", "Windsurf", {h + "/.codeium", h + "/.windsurf", support + "Windsurf"}},
+      {"com.todesktop.230313mzl4w4u92", "Cursor", {h + "/.cursor/extensions", support + "Cursor"}},
+      {"com.anthropic.claudefordesktop", "Claude", {support + "Claude"}},
+  };
+  for (const App& a : gone) {
+    if (apps.hasBundleId(a.id)) continue;
+    for (const std::string& p : a.paths) add(p, std::string("Left by ") + a.name + ", which is no longer installed", true);
+  }
+
+  // Caches and logs the tools rebuild on their own.
+  for (const char* n : {"debug", "paste-cache", "shell-snapshots"}) add(h + "/.claude/" + n, "Claude Code cache, rebuilt when needed", true);
+  add(h + "/.codex/log", "Codex logs", true);
+  for (const char* app : {"Cursor", "Windsurf", "Claude"})
+    for (const char* n : {"Cache", "Code Cache", "CachedData", "GPUCache", "logs"})
+      add(support + app + "/" + n, std::string(app) + " cache, rebuilt when needed", true);
+  add(support + "Claude/vm_bundles/warm", "Claude agent VM cache, rebuilt on launch", true);
+
+  // Transcripts and edit history: only what hasn't been touched for 30 days.
+  for (const char* dir : {"/.claude/projects", "/.claude/file-history"})
+    for (const std::string& n : listDir(h + dir))
+      add(h + dir + "/" + n, std::string("Claude Code ") + (hasSuffix(dir, "projects") ? "transcripts" : "edit history") +
+                                 ", untouched for 30+ days", true, 30);
+  for (const std::string& y : listDir(h + "/.codex/sessions"))
+    for (const std::string& m : listDir(h + "/.codex/sessions/" + y))
+      add(h + "/.codex/sessions/" + y + "/" + m, "Codex transcripts, untouched for 30+ days", true, 30);
+
+  // Big downloads that are slow to get back: listed, never preselected.
+  add(support + "Claude/vm_bundles/claudevm.bundle", "Claude agent VM image, downloaded again when needed", false);
+  add(h + "/.ollama/models", "Ollama models, downloaded again when needed", false);
+  add(h + "/.lmstudio/models", "LM Studio models, downloaded again when needed", false);
+  add(h + "/.cache/lm-studio", "LM Studio models, downloaded again when needed", false);
+  add(h + "/.cache/huggingface", "Hugging Face models and datasets", false);
+
+  std::sort(res.items.begin(), res.items.end(), [](const Found& a, const Found& b) {
+    if (a.preselect != b.preselect) return a.preselect;
+    return a.size > b.size;
+  });
+  finish(res);
+  return res;
+}
+
 // ───────────────────────────── trash ─────────────────────────────
 
 FinderResult findTrash(const FinderOptions& o) {

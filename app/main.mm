@@ -341,11 +341,11 @@ static AppSources resolveApps(const std::shared_ptr<ScanResult>& main, const std
   return out;
 }
 
-enum class Mode { Overview = 0, Browse, Reclaim, Duplicates, Leftovers, Downloads, Forgotten, BigFiles, Apps, Trash, Count };
+enum class Mode { Overview = 0, Browse, Reclaim, Duplicates, Leftovers, Downloads, Forgotten, BigFiles, Apps, Trash, Agents, Count };
 
 // Pages whose rows come from a finder that runs on demand, off the main thread.
 static bool isFinderMode(Mode m) {
-  return m == Mode::Duplicates || m == Mode::Leftovers || m == Mode::Downloads || m == Mode::Trash;
+  return m == Mode::Duplicates || m == Mode::Leftovers || m == Mode::Downloads || m == Mode::Trash || m == Mode::Agents;
 }
 
 struct ModeInfo {
@@ -392,6 +392,11 @@ static const ModeInfo kModes[] = {
     {@"Trash", @"trash.fill",
      @"What's waiting in your Trash. Emptying it is the only step in Stale that deletes for good.",
      @"The Trash is empty", @"Nothing to empty."},
+    {@"AI agents", @"cpu.fill",
+     @"What coding agents like Codex, Cursor, Claude Code and Conductor leave behind: worktrees, caches, "
+     @"logs, old transcripts and local models. Worktrees are preselected only after 14 days untouched with "
+     @"no unsaved work; models are never preselected.",
+     @"Nothing from AI agents", @"No worktrees, caches or models from coding agents here."},
 };
 
 // ───────────────────────────── views ─────────────────────────────
@@ -969,7 +974,7 @@ struct RingSeg {
   NSMenu* view = [[NSMenu alloc] initWithTitle:@"View"];
   for (int i = 0; i < (int)Mode::Count; ++i) {
     NSMenuItem* mi = [view addItemWithTitle:kModes[i].title action:@selector(modeFromMenu:)
-                              keyEquivalent:[NSString stringWithFormat:@"%d", (i + 1) % 10]];
+                              keyEquivalent:i < 10 ? [NSString stringWithFormat:@"%d", (i + 1) % 10] : @""];
     mi.tag = i;
   }
   [view addItem:NSMenuItem.separatorItem];
@@ -1054,6 +1059,7 @@ struct RingSeg {
   add(Mode::Duplicates, NO, nil);
   add(Mode::Leftovers, NO, nil);
   add(Mode::Downloads, NO, nil);
+  add(Mode::Agents, NO, nil);
   add(Mode::Overview, YES, @"Review");
   add(Mode::Forgotten, NO, nil);
   add(Mode::BigFiles, NO, nil);
@@ -2648,6 +2654,7 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
       case Mode::Leftovers: fr = findLeftovers(o); break;
       case Mode::Downloads: fr = findOldDownloads(o); break;
       case Mode::Trash: fr = findTrash(o); break;
+      case Mode::Agents: fr = findAgentFiles(o); break;
       default: break;
     }
     auto out = std::make_shared<FinderResult>(std::move(fr));
@@ -2727,6 +2734,7 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
     case Mode::Leftovers:
     case Mode::Downloads:
     case Mode::Trash:
+    case Mode::Agents:
       for (Item* it in _finderItems[(int)m]) if (stillThere(std_str(it.path))) [flat addObject:it];
       break;
     default: break;
