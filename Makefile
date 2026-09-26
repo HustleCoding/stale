@@ -9,7 +9,7 @@ LDFLAGS = $(ARCHFLAGS) -framework Foundation -framework CoreServices -framework 
 
 # Release metadata. VERSION is the user-facing version, BUILD the monotonically
 # increasing bundle version (defaults to the commit count).
-VERSION ?= 1.2.0
+VERSION ?= 1.3.0
 BUILD_NUMBER ?= $(shell git rev-list --count HEAD 2>/dev/null || echo 1)
 
 # Code signing. Default is ad-hoc (runs locally, Gatekeeper warns on other Macs).
@@ -23,6 +23,16 @@ endif
 # Notarization uses a keychain profile created once with:
 #   xcrun notarytool store-credentials stale --apple-id you@example.com --team-id TEAMID
 NOTARY_PROFILE ?= stale
+
+# Sparkle auto-updates. The framework is fetched once and checked against a pinned hash.
+# SPARKLE_PUBLIC_KEY is the EdDSA public key from Sparkle's generate_keys; when empty the
+# app builds without its "Check for Updates…" item (e.g. local/dev builds).
+SPARKLE_VERSION = 2.10.0
+SPARKLE_SHA256 = c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c
+SPARKLE_PUBLIC_KEY ?=
+SPARKLE_FEED = https://github.com/HustleCoding/stale/releases/latest/download/appcast.xml
+SPARKLE_DIR = $(BUILD)/Sparkle-$(SPARKLE_VERSION)
+SPARKLE_FW = $(SPARKLE_DIR)/Sparkle.framework
 
 BUILD = build
 SRC = src
@@ -45,16 +55,34 @@ $(BUILD)/stale: $(OBJS)
 	$(CXX) $(OBJS) $(LDFLAGS) -o $@
 	codesign -f $(SIGN_FLAGS) $@
 
-$(APP_BIN): $(CORE) $(BUILD)/app.o app/Info.plist app/Stale.entitlements $(ICON)
+$(APP_BIN): $(CORE) $(BUILD)/app.o app/Info.plist app/Stale.entitlements $(ICON) $(SPARKLE_FW)
 	rm -rf $(APP)
-	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
-	sed -e 's/@VERSION@/$(VERSION)/' -e 's/@BUILD@/$(BUILD_NUMBER)/' app/Info.plist > $(APP)/Contents/Info.plist
+	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources $(APP)/Contents/Frameworks
+	sed -e 's/@VERSION@/$(VERSION)/' -e 's/@BUILD@/$(BUILD_NUMBER)/' \
+	    -e 's|@SPARKLE_FEED@|$(SPARKLE_FEED)|' -e 's|@SPARKLE_PUBLIC_KEY@|$(SPARKLE_PUBLIC_KEY)|' \
+	    app/Info.plist > $(APP)/Contents/Info.plist
 	cp $(ICON) $(APP)/Contents/Resources/Stale.icns
-	$(CXX) $(CORE) $(BUILD)/app.o $(LDFLAGS) -framework Cocoa -framework Quartz -o $@
+	$(CXX) $(CORE) $(BUILD)/app.o $(LDFLAGS) -framework Cocoa -framework Quartz \
+	    -F$(SPARKLE_DIR) -framework Sparkle -Wl,-rpath,@executable_path/../Frameworks -o $@
+	ditto $(SPARKLE_FW) $(APP)/Contents/Frameworks/Sparkle.framework
+	@# Stale isn't sandboxed, so Sparkle's XPC services are unused (per Sparkle's sandboxing docs).
+	rm -rf $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices \
+	       $(APP)/Contents/Frameworks/Sparkle.framework/XPCServices
+	codesign -f $(SIGN_FLAGS) $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate
+	codesign -f $(SIGN_FLAGS) $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app
+	codesign -f $(SIGN_FLAGS) $(APP)/Contents/Frameworks/Sparkle.framework
 	codesign -f $(SIGN_FLAGS) --entitlements app/Stale.entitlements $(APP)
 
-$(BUILD)/app.o: app/main.mm $(SRC)/scan.h $(SRC)/index.h $(SRC)/fsevents.h $(SRC)/finders.h | $(BUILD)
-	$(CXX) $(OBJCXXFLAGS) $(ARCHFLAGS) -c $< -o $@
+$(BUILD)/app.o: app/main.mm $(SRC)/scan.h $(SRC)/index.h $(SRC)/fsevents.h $(SRC)/finders.h $(SPARKLE_FW) | $(BUILD)
+	$(CXX) $(OBJCXXFLAGS) $(ARCHFLAGS) -F$(SPARKLE_DIR) -c $< -o $@
+
+$(SPARKLE_FW): | $(BUILD)
+	curl -fsSL -o $(BUILD)/Sparkle-$(SPARKLE_VERSION).tar.xz \
+	    https://github.com/sparkle-project/Sparkle/releases/download/$(SPARKLE_VERSION)/Sparkle-$(SPARKLE_VERSION).tar.xz
+	echo "$(SPARKLE_SHA256)  $(BUILD)/Sparkle-$(SPARKLE_VERSION).tar.xz" | shasum -a 256 -c -
+	rm -rf $(SPARKLE_DIR) && mkdir -p $(SPARKLE_DIR)
+	tar -xJf $(BUILD)/Sparkle-$(SPARKLE_VERSION).tar.xz -C $(SPARKLE_DIR)
+	touch $@
 
 $(BUILD)/mkicon: app/mkicon.mm | $(BUILD)
 	$(CXX) $(OBJCXXFLAGS) $< -framework Cocoa -o $@

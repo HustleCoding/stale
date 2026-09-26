@@ -6,6 +6,9 @@
 // following the disk while open. Everything goes to the Trash, nothing is deleted outright.
 #import <Cocoa/Cocoa.h>
 #import <Quartz/Quartz.h>
+#import <Sparkle/Sparkle.h>
+
+#include <fcntl.h>
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -214,6 +217,39 @@ static void fixSize(NSView* v, CGFloat w, CGFloat h) {
   if (w > 0) [v.widthAnchor constraintEqualToConstant:w].active = YES;
   if (h > 0) [v.heightAnchor constraintEqualToConstant:h].active = YES;
 }
+
+// macOS gives no API to ask; probe files only readable with Full Disk Access.
+static BOOL hasFullDiskAccess() {
+  NSString* home = NSHomeDirectory();
+  for (NSString* rel in @[ @"Library/Application Support/com.apple.TCC/TCC.db", @"Library/Safari" ]) {
+    std::string path = std_str([home stringByAppendingPathComponent:rel]);
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+      close(fd);
+      return YES;
+    }
+    if (errno == EPERM || errno == EACCES) return NO;
+  }
+  return YES;
+}
+
+// The app's icon, draggable into the Full Disk Access list in System Settings.
+@interface DragIconView : NSImageView <NSDraggingSource>
+@end
+@implementation DragIconView
+- (BOOL)acceptsFirstMouse:(NSEvent*)e { return YES; }
+- (void)resetCursorRects { [self addCursorRect:self.bounds cursor:NSCursor.openHandCursor]; }
+- (void)mouseDown:(NSEvent*)e {
+  NSURL* app = NSBundle.mainBundle.bundleURL;
+  NSDraggingItem* item = [[NSDraggingItem alloc] initWithPasteboardWriter:app];
+  [item setDraggingFrame:self.bounds contents:self.image];
+  [self beginDraggingSessionWithItems:@[ item ] event:e source:self];
+}
+- (NSDragOperation)draggingSession:(NSDraggingSession*)s sourceOperationMaskForDraggingContext:(NSDraggingContext)c {
+  return c == NSDraggingContextOutsideApplication ? NSDragOperationCopy | NSDragOperationGeneric | NSDragOperationLink
+                                                  : NSDragOperationNone;
+}
+@end
 
 // ───────────────────────────── model ─────────────────────────────
 
@@ -810,6 +846,14 @@ struct RingSeg {
   BOOL _refreshing;   // a patch is being collected off the main thread
   double _refreshStarted;
   NSTimer* _refreshTimer;
+
+  SPUStandardUpdaterController* _updater;  // nil when the build has no update key
+  NSWindow* _fdaSheet;
+  NSTimer* _fdaTimer;
+  NSImageView* _fdaStatusIcon;
+  NSProgressIndicator* _fdaSpinner;
+  NSTextField* _fdaStatus;
+  BOOL _scanAfterFDA;  // the first index waits until the access sheet is answered
 }
 
 // ───── app lifecycle ─────
@@ -819,6 +863,9 @@ struct RingSeg {
   _sortKey = @"size";
   _sortAscending = NO;
   _mode = Mode::Overview;
+  NSString* key = [NSBundle.mainBundle objectForInfoDictionaryKey:@"SUPublicEDKey"];
+  if (key.length && ![key hasPrefix:@"@"])
+    _updater = [[SPUStandardUpdaterController alloc] initWithStartingUpdater:YES updaterDelegate:nil userDriverDelegate:nil];
   [self buildMenus];
   [self buildWindow];
   [self installEscapeMonitor];
@@ -830,7 +877,9 @@ struct RingSeg {
     if ([NSFileManager.defaultManager fileExistsAtPath:args[1] isDirectory:&isDir] && isDir)
       start = std_str(args[1].stringByStandardizingPath);
   }
+  BOOL askFDA = !hasFullDiskAccess() && ![NSUserDefaults.standardUserDefaults boolForKey:@"FDAPromptDismissed"];
   [self openRoot:start];
+  if (askFDA) [self showFDASheet];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)a { return YES; }
@@ -872,6 +921,10 @@ struct RingSeg {
   [menubar addItem:appItem];
   NSMenu* app = [NSMenu new];
   [app addItemWithTitle:@"About Stale" action:@selector(orderFrontStandardAboutPanel:) keyEquivalent:@""];
+  if (_updater) {
+    NSMenuItem* upd = [app addItemWithTitle:@"Check for Updates…" action:@selector(checkForUpdates:) keyEquivalent:@""];
+    upd.target = _updater;
+  }
   [app addItem:NSMenuItem.separatorItem];
   [app addItemWithTitle:@"Hide Stale" action:@selector(hide:) keyEquivalent:@"h"];
   NSMenuItem* hideOthers = [app addItemWithTitle:@"Hide Others" action:@selector(hideOtherApplications:) keyEquivalent:@"h"];
@@ -1462,9 +1515,156 @@ struct RingSeg {
 - (void)openGitHub:(id)sender {
   [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"https://github.com/HustleCoding/stale"]];
 }
-- (void)openFDA:(id)sender {
+- (void)openFDA:(id)sender { [self showFDASheet]; }
+
+- (void)openPrivacySettings:(id)sender {
   [[NSWorkspace sharedWorkspace]
       openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"]];
+  _fdaSpinner.hidden = NO;
+  [_fdaSpinner startAnimation:nil];
+  _fdaStatus.stringValue = @"Waiting for you to switch Stale on…";
+}
+
+// ───── Full Disk Access ─────
+
+static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
+  NSTextField* num = label([NSString stringWithFormat:@"%d", n], 12, NSFontWeightBold, NSColor.whiteColor);
+  num.alignment = NSTextAlignmentCenter;
+  NSView* dot = [NSView new];
+  dot.wantsLayer = YES;
+  dot.layer.backgroundColor = NSColor.controlAccentColor.CGColor;
+  dot.layer.cornerRadius = 11;
+  fixSize(dot, 22, 22);
+  num.translatesAutoresizingMaskIntoConstraints = NO;
+  [dot addSubview:num];
+  [NSLayoutConstraint activateConstraints:@[
+    [num.centerXAnchor constraintEqualToAnchor:dot.centerXAnchor],
+    [num.centerYAnchor constraintEqualToAnchor:dot.centerYAnchor],
+  ]];
+  NSTextField* t = [NSTextField wrappingLabelWithString:text];
+  t.font = [NSFont systemFontOfSize:13];
+  t.selectable = NO;
+  [t setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+  NSMutableArray* views = [NSMutableArray arrayWithObjects:dot, t, nil];
+  if (accessory) [views addObject:accessory];
+  NSStackView* row = [NSStackView stackViewWithViews:views];
+  row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+  row.alignment = NSLayoutAttributeCenterY;
+  row.spacing = 12;
+  return row;
+}
+
+- (void)showFDASheet {
+  if (_fdaSheet || !_window) return;
+  NSWindow* sheet = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 480, 10)
+                                                styleMask:NSWindowStyleMaskTitled
+                                                  backing:NSBackingStoreBuffered
+                                                    defer:NO];
+  NSImageView* icon = [NSImageView imageViewWithImage:symbol(@"lock.open.fill", 34, NSFontWeightRegular)];
+  icon.contentTintColor = NSColor.controlAccentColor;
+  NSTextField* title = label(@"Let Stale see your whole Mac", 20, NSFontWeightSemibold, NSColor.labelColor);
+  title.font = roundedFont(20, NSFontWeightSemibold);
+  NSTextField* body = [NSTextField wrappingLabelWithString:
+      @"macOS keeps some folders private — Mail, Messages, Safari, the Trash. Stale needs Full Disk Access "
+      @"to measure them. It only reads sizes and dates; nothing ever leaves your Mac."];
+  body.font = [NSFont systemFontOfSize:13];
+  body.textColor = NSColor.secondaryLabelColor;
+  body.alignment = NSTextAlignmentCenter;
+  body.selectable = NO;
+
+  DragIconView* drag = [DragIconView imageViewWithImage:NSApp.applicationIconImage];
+  drag.imageScaling = NSImageScaleProportionallyUpOrDown;
+  drag.toolTip = @"Drag into the Full Disk Access list";
+  fixSize(drag, 36, 36);
+  NSStackView* steps = [NSStackView stackViewWithViews:@[
+    fdaStep(1, @"Click Open Privacy Settings below.", nil),
+    fdaStep(2, @"Switch Stale on. Not in the list? Drag this icon into it.", drag),
+    fdaStep(3, @"Come back — Stale notices by itself.", nil),
+  ]];
+  steps.orientation = NSUserInterfaceLayoutOrientationVertical;
+  steps.alignment = NSLayoutAttributeLeading;
+  steps.spacing = 12;
+  NSBox* card = [NSBox new];
+  card.boxType = NSBoxCustom;
+  card.borderWidth = 0;
+  card.cornerRadius = 10;
+  card.fillColor = [NSColor.labelColor colorWithAlphaComponent:0.05];
+  card.contentViewMargins = NSMakeSize(0, 0);
+  pin(steps, card.contentView, NSEdgeInsetsMake(14, 16, 14, 16));
+  for (NSView* v in steps.arrangedSubviews) [v.widthAnchor constraintEqualToAnchor:steps.widthAnchor].active = YES;
+
+  _fdaStatusIcon = [NSImageView imageViewWithImage:symbol(@"checkmark.circle.fill", 14, NSFontWeightSemibold)];
+  _fdaStatusIcon.contentTintColor = NSColor.systemGreenColor;
+  _fdaStatusIcon.hidden = YES;
+  _fdaSpinner = [NSProgressIndicator new];
+  _fdaSpinner.style = NSProgressIndicatorStyleSpinning;
+  _fdaSpinner.controlSize = NSControlSizeSmall;
+  _fdaSpinner.hidden = YES;
+  fixSize(_fdaSpinner, 14, 14);
+  _fdaStatus = label(@"", 12, NSFontWeightMedium, NSColor.secondaryLabelColor);
+  NSStackView* status = [NSStackView stackViewWithViews:@[ _fdaSpinner, _fdaStatusIcon, _fdaStatus ]];
+  status.spacing = 6;
+  [status.heightAnchor constraintEqualToConstant:16].active = YES;
+
+  NSButton* later = [NSButton buttonWithTitle:@"Not Now" target:self action:@selector(dismissFDASheet:)];
+  later.keyEquivalent = @"\033";
+  NSButton* open = [NSButton buttonWithTitle:@"Open Privacy Settings" target:self action:@selector(openPrivacySettings:)];
+  open.keyEquivalent = @"\r";
+  NSView* spacer = [NSView new];
+  [spacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+  NSStackView* buttons = [NSStackView stackViewWithViews:@[ spacer, later, open ]];
+  buttons.spacing = 8;
+
+  NSStackView* col = [NSStackView stackViewWithViews:@[ icon, title, body, card, status, buttons ]];
+  col.orientation = NSUserInterfaceLayoutOrientationVertical;
+  col.spacing = 8;
+  [col setCustomSpacing:12 afterView:icon];
+  [col setCustomSpacing:18 afterView:body];
+  [col setCustomSpacing:12 afterView:card];
+  [col setCustomSpacing:12 afterView:status];
+  pin(col, sheet.contentView, NSEdgeInsetsMake(26, 28, 20, 28));
+  for (NSView* v in @[ body, card, buttons ]) [v.widthAnchor constraintEqualToAnchor:col.widthAnchor].active = YES;
+  [col.widthAnchor constraintEqualToConstant:424].active = YES;
+
+  _fdaSheet = sheet;
+  [_window beginSheet:sheet completionHandler:nil];
+  __weak StaleController* weakSelf = self;
+  _fdaTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer* t) {
+    StaleController* s = weakSelf;
+    if (s && hasFullDiskAccess()) [s fdaGranted];
+  }];
+}
+
+- (void)fdaGranted {
+  [_fdaTimer invalidate];
+  _fdaTimer = nil;
+  [_fdaSpinner stopAnimation:nil];
+  _fdaSpinner.hidden = YES;
+  _fdaStatusIcon.hidden = NO;
+  _fdaStatus.stringValue = @"Access granted — indexing everything now.";
+  _fdaStatus.textColor = NSColor.labelColor;
+  [NSApp activateIgnoringOtherApps:YES];
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // An index made without access is missing the private folders; rebuild it with them.
+    BOOL partial = self->_model.result && self->_model.result->errors > 0;
+    [self closeFDASheetAndScan:partial];
+  });
+}
+
+- (void)dismissFDASheet:(id)sender {
+  [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"FDAPromptDismissed"];
+  [self closeFDASheetAndScan:NO];
+}
+
+- (void)closeFDASheetAndScan:(BOOL)rescan {
+  if (!_fdaSheet) return;
+  [_fdaTimer invalidate];
+  _fdaTimer = nil;
+  [_window endSheet:_fdaSheet];
+  _fdaSheet = nil;
+  BOOL scan = _scanAfterFDA || rescan;
+  _scanAfterFDA = NO;
+  if (scan && !_loading && !_scanning && !_scanPath.empty()) [self scanPath:_scanPath];
 }
 - (void)revealIndex:(id)sender {
   NSString* dir = ns_str(indexDir());
@@ -1520,7 +1720,10 @@ struct RingSeg {
       if (gen != self->_scanGeneration) return;
       self->_loading = NO;
       if (ok) [self installResult:res apps:apps meta:meta];
-      if (!ok || stalePosition) [self scanPath:root];
+      if (!ok || stalePosition) {
+        if (self->_fdaSheet) self->_scanAfterFDA = YES;
+        else [self scanPath:root];
+      }
     });
   });
 }

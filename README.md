@@ -92,6 +92,12 @@ in the Trash. Folders expand down to files; Space shows a Quick Look preview,
 without asking — everything goes to the Trash, and only the Trash page's
 explicit **Empty Trash…** deletes for good.
 
+On first launch without Full Disk Access, a short sheet explains why it's needed,
+opens the right Settings pane (the app icon can be dragged straight into the list)
+and closes by itself once access is granted, then indexes. **Help → Grant Full Disk
+Access…** brings it back. Updates arrive through [Sparkle](https://sparkle-project.org):
+Stale checks daily and **Stale → Check for Updates…** checks now.
+
 ## Build
 
 ```
@@ -100,7 +106,8 @@ make ARCHS=arm64  # quicker local build
 make install    # → /usr/local/bin/stale + /Applications/Stale.app
 ```
 
-Requires Xcode Command Line Tools. No third-party dependencies. The app icon and
+Requires Xcode Command Line Tools. The only dependency, Sparkle (auto-updates), is
+downloaded on first build and checked against a pinned SHA-256. The app icon and
 the DMG background are rendered at build time (`app/mkicon.mm`, `app/mkdmgbg.mm`).
 
 ## Distribution
@@ -134,6 +141,11 @@ Add these repository secrets (Settings → Secrets and variables → Actions):
 | `APPLE_ID` | Apple ID e-mail of the developer account |
 | `APPLE_TEAM_ID` | 10-character Team ID (the part in parentheses in the certificate name) |
 | `APPLE_APP_PASSWORD` | an [app-specific password](https://appleid.apple.com/account/manage) for that Apple ID |
+| `SPARKLE_ED_PRIVATE_KEY` | Sparkle update-signing key: `generate_keys` (from the Sparkle download) then `generate_keys -x key.txt`; its public half is `SPARKLE_PUBLIC_KEY` in the Makefile |
+
+The release also carries `appcast.xml`, the update feed installed copies read from
+`releases/latest/download/appcast.xml` — so the repository (or at least its
+releases) must be public.
 
 The certificate is imported into a throw-away keychain on the runner and deleted
 afterwards. If the secrets are missing, the release job still publishes an ad-hoc

@@ -32,6 +32,12 @@
 	<string>NSApplication</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
+	<key>SUFeedURL</key>
+	<string>@SPARKLE_FEED@</string>
+	<key>SUPublicEDKey</key>
+	<string>@SPARKLE_PUBLIC_KEY@</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>© HustleCoding. MIT License.</string>
 </dict>

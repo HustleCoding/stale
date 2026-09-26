@@ -52,6 +52,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the bundle version is the commit count; Sparkle compares it
 
       - name: Pick version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
@@ -112,6 +114,43 @@ jobs:
       - name: Build (ad-hoc fallback)
         if: steps.secrets.outputs.signed != 'true'
         run: make dist VERSION="$VERSION"
+
+      # Sparkle update feed. SPARKLE_ED_PRIVATE_KEY is the key exported with
+      # `generate_keys -x`; its public half is SPARKLE_PUBLIC_KEY in the Makefile.
+      # The feed is served from the latest release: releases/latest/download/appcast.xml.
+      - name: Sparkle appcast
+        env:
+          SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$SPARKLE_KEY" ]]; then
+            echo "::warning::SPARKLE_ED_PRIVATE_KEY missing — no update feed; installed copies won't see this release."
+            exit 0
+          fi
+          ZIP="dist/Stale-$VERSION.zip"
+          KEYFILE="$RUNNER_TEMP/sparkle.key"
+          printf '%s' "$SPARKLE_KEY" > "$KEYFILE"
+          SIG=$(build/Sparkle-*/bin/sign_update --ed-key-file "$KEYFILE" -p "$ZIP")
+          rm -f "$KEYFILE"
+          BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" build/Stale.app/Contents/Info.plist)
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/Stale-$VERSION.zip"
+          cat > dist/appcast.xml <<XML
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+              <title>Stale</title>
+              <item>
+                <title>Stale $VERSION</title>
+                <link>https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}</link>
+                <sparkle:version>$BUILD</sparkle:version>
+                <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
+                <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+                <pubDate>$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')</pubDate>
+                <enclosure url="$URL" length="$(stat -f%z "$ZIP")" type="application/octet-stream" sparkle:edSignature="$SIG"/>
+              </item>
+            </channel>
+          </rss>
+          XML
+          cat dist/appcast.xml
 
       - name: Checksums
         run: (cd dist && shasum -a 256 Stale-*.zip Stale-*.dmg > SHA256SUMS.txt && cat SHA256SUMS.txt)
