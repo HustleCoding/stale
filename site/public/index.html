@@ -27,13 +27,32 @@
   .btn { display:inline-flex; align-items:center; gap:10px; background:var(--accent); color:#fff; text-decoration:none; font-weight:600; padding:14px 28px; border-radius:980px; font-size:17px; transition:transform .15s, filter .15s; }
   .btn:hover { filter:brightness(1.08); transform:translateY(-1px); }
   .small { font-size:14px; color:var(--muted); }
-  .small code { font:13px ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--line); padding:3px 8px; border-radius:6px; user-select:all; }
+  .small code { font:13px ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--line); padding:3px 8px; border-radius:6px; user-select:all; overflow-wrap:anywhere; }
   .shot { margin:24px auto 0; }
   .shot img { width:100%; height:auto; display:block; }
-  .features { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:20px; padding:72px 0; }
-  .f { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:28px; }
-  .f h3 { font-size:19px; margin-bottom:8px; }
-  .f p { color:var(--muted); font-size:15px; }
+  .features { padding:112px 0 96px; }
+  .features > .head { text-align:center; max-width:640px; margin:0 auto 48px; }
+  .eyebrow { font-size:14px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--accent); }
+  .features h2 { font-size:clamp(32px,4.5vw,48px); line-height:1.08; letter-spacing:-.02em; margin:10px 0 14px; }
+  .features > .head p { color:var(--muted); font-size:19px; }
+  .grid { display:grid; grid-template-columns:repeat(6,1fr); gap:20px; }
+  .f { grid-column:span 2; position:relative; overflow:hidden; background:var(--card); border:1px solid var(--line); border-radius:24px; padding:32px; box-shadow:0 1px 2px rgba(0,0,0,.04), 0 12px 32px -18px rgba(0,0,0,.18); transition:transform .25s, box-shadow .25s; }
+  .f:hover { transform:translateY(-3px); box-shadow:0 1px 2px rgba(0,0,0,.04), 0 24px 48px -20px rgba(0,0,0,.28); }
+  .f.wide { grid-column:span 3; }
+  .f::before { content:""; position:absolute; inset:0 0 auto; height:120px; background:radial-gradient(120% 100% at 0 0, var(--tint), transparent 70%); opacity:.14; pointer-events:none; }
+  .ic { width:44px; height:44px; border-radius:12px; display:grid; place-items:center; background:var(--tint); color:#fff; margin-bottom:20px; box-shadow:inset 0 1px 0 rgba(255,255,255,.35), 0 6px 16px -6px var(--tint); }
+  .ic svg { width:22px; height:22px; }
+  .f h3 { font-size:21px; letter-spacing:-.01em; margin-bottom:8px; }
+  .f p { color:var(--muted); font-size:16px; }
+  .bar { display:flex; height:12px; border-radius:6px; overflow:hidden; margin:24px 0 10px; gap:2px; }
+  .bar i { display:block; }
+  .legend { display:flex; flex-wrap:wrap; gap:6px 14px; font-size:13px; color:var(--muted); }
+  .legend b { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:1px; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:22px; }
+  .chips span { font-size:13px; padding:5px 11px; border-radius:980px; border:1px solid var(--line); color:var(--fg); background:var(--bg); }
+  .stat { font-size:44px; font-weight:700; letter-spacing:-.03em; margin-top:18px; line-height:1; }
+  .stat small { font-size:15px; font-weight:500; color:var(--muted); letter-spacing:0; margin-left:6px; }
+  @media (max-width:860px) { .grid { grid-template-columns:minmax(0,1fr); } .f, .f.wide { grid-column:auto; } }
   footer { border-top:1px solid var(--line); padding:28px 0 48px; display:flex; justify-content:space-between; flex-wrap:wrap; gap:12px; color:var(--muted); font-size:14px; }
   footer a { color:var(--muted); }
 </style>
@@ -59,10 +78,42 @@
   <div class="shot"><img src="/screenshot.png" alt="Stale showing a Mac's disk usage by last use" width="1800" height="1261"></div>
 
   <section class="features">
-    <div class="f"><h3>By last use</h3><p>Every folder sorted into this week, this month, last 6 months, over a year or never opened, using Spotlight's "last opened" dates.</p></div>
-    <div class="f"><h3>Safe to clean up</h3><p>Caches, build folders, duplicates, leftovers from deleted apps and old downloads. Everything goes to the Trash, never straight to deletion.</p></div>
-    <div class="f"><h3>Fast and always current</h3><p>Stale indexes once, then keeps up with changes in the background. It opens instantly, with no rescan on every launch.</p></div>
-    <div class="f"><h3>Private by design</h3><p>Stale only reads file sizes and dates. Nothing leaves your Mac: no account, no analytics.</p></div>
+    <div class="head">
+      <span class="eyebrow">Why Stale</span>
+      <h2>Know what to keep.<br>Clear what you don't.</h2>
+      <p>One index of your whole Mac, sorted by when you last used each thing.</p>
+    </div>
+    <div class="grid">
+      <div class="f wide" style="--tint:#10B981">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>
+        <h3>Sorted by last use</h3>
+        <p>Every folder lands in this week, this month, the last six months, over a year, or never opened, using the "last opened" dates macOS already keeps.</p>
+        <div class="bar"><i style="flex:34;background:#10B981"></i><i style="flex:26;background:#14B8A6"></i><i style="flex:20;background:#3B82F6"></i><i style="flex:12;background:#F59E0B"></i><i style="flex:8;background:#F43F5E"></i></div>
+        <div class="legend"><span><b style="background:#10B981"></b>This week</span><span><b style="background:#14B8A6"></b>This month</span><span><b style="background:#3B82F6"></b>6 months</span><span><b style="background:#F59E0B"></b>Over a year</span><span><b style="background:#F43F5E"></b>Never opened</span></div>
+      </div>
+      <div class="f wide" style="--tint:#3B82F6">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg></div>
+        <h3>Safe to clean up</h3>
+        <p>The space you can actually get back, ready to review. Everything goes to the Trash, never straight to deletion.</p>
+        <div class="chips"><span>Caches</span><span>Build folders</span><span>Duplicates</span><span>Old downloads</span><span>Leftovers of deleted apps</span></div>
+      </div>
+      <div class="f" style="--tint:#F59E0B">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg></div>
+        <h3>Opens instantly</h3>
+        <p>Stale indexes once, then keeps up with changes in the background. No rescan on every launch.</p>
+        <div class="stat">0.1 s<small>to reopen</small></div>
+      </div>
+      <div class="f" style="--tint:#6366F1">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>
+        <h3>Private by design</h3>
+        <p>Stale reads only sizes and dates. Nothing leaves your Mac: no account, no analytics.</p>
+      </div>
+      <div class="f" style="--tint:#14B8A6">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M21 3v6h-6"/></svg></div>
+        <h3>Native and up to date</h3>
+        <p>A small, signed and notarized Mac app for Apple silicon and Intel. Updates install themselves.</p>
+      </div>
+    </div>
   </section>
 
   <footer>
