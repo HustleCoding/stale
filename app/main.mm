@@ -704,6 +704,7 @@ struct RingSeg {
   if (NSPointInRect(p, self.bounds) && _target && _action) [NSApp sendAction:_action to:_target from:self];
 }
 - (void)resetCursorRects { [self addCursorRect:self.bounds cursor:NSCursor.pointingHandCursor]; }
+- (NSView*)hitTest:(NSPoint)p { return [super hitTest:p] ? self : nil; }
 @end
 
 // ───────────────────────────── sidebar ─────────────────────────────
@@ -1579,7 +1580,7 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
   NSStackView* steps = [NSStackView stackViewWithViews:@[
     fdaStep(1, @"Click Open Privacy Settings below.", nil),
     fdaStep(2, @"Switch Stale on. Not in the list? Drag this icon into it.", drag),
-    fdaStep(3, @"Come back — Stale notices by itself.", nil),
+    fdaStep(3, @"Come back. If macOS offers Quit & Reopen, choose Later — Stale notices by itself.", nil),
   ]];
   steps.orientation = NSUserInterfaceLayoutOrientationVertical;
   steps.alignment = NSLayoutAttributeLeading;
