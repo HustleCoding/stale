@@ -96,7 +96,8 @@ On first launch without Full Disk Access, a short sheet explains why it's needed
 opens the right Settings pane (the app icon can be dragged straight into the list)
 and closes by itself once access is granted, then indexes. **Help → Grant Full Disk
 Access…** brings it back. Updates arrive through [Sparkle](https://sparkle-project.org):
-Stale checks daily and **Stale → Check for Updates…** checks now.
+Stale checks daily and installs updates silently in the background; **Stale → Check
+for Updates…** checks now.
 
 ## Build
 

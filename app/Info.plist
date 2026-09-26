@@ -38,6 +38,8 @@
 	<string>@SPARKLE_PUBLIC_KEY@</string>
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>© HustleCoding. MIT License.</string>
 </dict>
