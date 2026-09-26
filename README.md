@@ -86,7 +86,10 @@ recency buckets. The sidebar's *Clean up* group finds space: Safe to delete
 SHA-256; the most recently used copy is kept), Leftovers (Library data of apps
 that are no longer installed, old iPhone/iPad backups) and Old downloads
 (installers whose app is already installed, archives, anything not opened in 30
-days). *Review* lists forgotten folders, big unused files, unused apps and what's
+days), and AI agents (worktrees, caches, logs, old transcripts and local models
+left by Codex, Cursor, Claude Code, Conductor and similar tools; a worktree is
+preselected only after 14 days untouched with no uncommitted changes and HEAD on
+a branch, and models are never preselected). *Review* lists forgotten folders, big unused files, unused apps and what's
 in the Trash. Folders expand down to files; Space shows a Quick Look preview,
 ⌘↓ opens, right-click reveals in Finder or copies the path. Nothing is deleted
 without asking — everything goes to the Trash, and only the Trash page's

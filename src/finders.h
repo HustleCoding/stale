@@ -51,6 +51,12 @@ FinderResult findLeftovers(const FinderOptions& o);
 // already in an Applications folder are preselected; everything else is listed for review.
 FinderResult findOldDownloads(const FinderOptions& o, double olderThanDays = 30);
 
+// Files that AI coding agents leave behind: worktrees (Codex, Cursor, Claude Code, Conductor),
+// their caches, logs and old transcripts, local models, and folders of agent apps that are no
+// longer installed. Worktrees are preselected only when untouched for 14 days with no
+// uncommitted changes and HEAD on a branch; models are never preselected.
+FinderResult findAgentFiles(const FinderOptions& o);
+
 // Contents of the user's Trash.
 FinderResult findTrash(const FinderOptions& o);
 

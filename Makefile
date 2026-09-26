@@ -9,7 +9,7 @@ LDFLAGS = $(ARCHFLAGS) -framework Foundation -framework CoreServices -framework 
 
 # Release metadata. VERSION is the user-facing version, BUILD the monotonically
 # increasing bundle version (defaults to the commit count).
-VERSION ?= 1.3.2
+VERSION ?= 1.4.0
 BUILD_NUMBER ?= $(shell git rev-list --count HEAD 2>/dev/null || echo 1)
 
 # Code signing. Default is ad-hoc (runs locally, Gatekeeper warns on other Macs).
