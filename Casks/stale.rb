@@ -7,8 +7,7 @@ cask "stale" do
   desc "Shows what you use on your Mac and what you can delete"
   homepage "https://stale.f-dobinciuc7.workers.dev/"
 
-  auto_updates true
-  depends_on macos: ">= :monterey"
+  depends_on macos: :monterey
 
   app "Stale.app"
 
