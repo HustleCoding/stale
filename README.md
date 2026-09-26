@@ -72,15 +72,25 @@ Recognised categories (treated as leaf "units" in reports):
 
 The Mac app (`make app`, or the DMG from Releases) indexes the whole disk (`/`)
 once and remembers the result in `~/Library/Application Support/Stale/`, so later
-launches open instantly from the saved index — the header shows how old it is
-("Indexed 3 h ago"). It only re-indexes when you click **Rescan**; moving items to
-the Trash from the app updates the saved index in place. Open a different folder
-with the folder button (or `open -a Stale <path>`); each root keeps its own index.
+launches open instantly from the saved index. The index then keeps itself current
+with FSEvents: on launch the app replays what changed on disk since the index was
+saved and re-reads only those folders, and while it runs it follows changes live
+("Up to date"). A full **Rescan** is still there for when you want it (and happens
+by itself if FSEvents lost track — dropped events, a swapped volume, too many
+changes). Open a different folder with the folder button (or
+`open -a Stale <path>`); each root keeps its own index.
 
 The Overview shows what's on the disk as a two-level segmented ring plus a bar of
-recency buckets; the sidebar groups reclaimable data (Safe to delete), forgotten
-folders, big unused files and unused apps. Nothing is ever deleted — everything
-goes to the Trash.
+recency buckets. The sidebar's *Clean up* group finds space: Safe to delete
+(caches, build output, package stores), Duplicates (same content, verified by
+SHA-256; the most recently used copy is kept), Leftovers (Library data of apps
+that are no longer installed, old iPhone/iPad backups) and Old downloads
+(installers whose app is already installed, archives, anything not opened in 30
+days). *Review* lists forgotten folders, big unused files, unused apps and what's
+in the Trash. Folders expand down to files; Space shows a Quick Look preview,
+⌘↓ opens, right-click reveals in Finder or copies the path. Nothing is deleted
+without asking — everything goes to the Trash, and only the Trash page's
+explicit **Empty Trash…** deletes for good.
 
 ## Build
 

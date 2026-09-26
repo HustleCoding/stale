@@ -1,26 +1,29 @@
 #pragma once
 #include <string>
+#include <vector>
 
 #include "scan.h"
 
 namespace stale {
 
-// On-disk copy of a completed scan so the app opens instantly and only rescans on demand.
-// Files live in ~/Library/Application Support/Stale/, one per scanned root.
+// Everything about an index besides the scan itself.
+struct IndexMeta {
+  double savedAt = 0;
+  uint64_t eventId = 0;                  // FSEvents id current when saved; 0 = unknown
+  std::vector<std::string> volumeUUIDs;  // FSEvents UUIDs of the volumes covered, root first
+};
 
 std::string indexDir();
 std::string indexPath(const std::string& root);
 
-// Serialize without touching the disk (fast enough for the main thread), then write
-// atomically (tmp file + rename) from any thread.
-std::string encodeIndex(const std::string& root, const ScanResult& r, double savedAt);
+// Encode the index (gone directories are dropped and ids compacted). Empty on failure.
+std::string encodeIndex(const std::string& root, const ScanResult& r, const IndexMeta& meta);
+// Atomically replace `file` with `bytes`.
 bool writeIndex(const std::string& file, const std::string& bytes);
 
-// encodeIndex + writeIndex. `savedAt` is unix seconds.
-bool saveIndex(const std::string& file, const std::string& root, const ScanResult& r, double savedAt);
+bool saveIndex(const std::string& file, const std::string& root, const ScanResult& r, const IndexMeta& meta);
 
-// Returns false (and leaves `out` untouched) for a missing, corrupt, foreign-root or
-// incompatible-version file.
-bool loadIndex(const std::string& file, const std::string& root, ScanResult& out, double* savedAt);
+// False if missing, corrupt, from another version, or for another root.
+bool loadIndex(const std::string& file, const std::string& root, ScanResult& out, IndexMeta* meta);
 
 }  // namespace stale
