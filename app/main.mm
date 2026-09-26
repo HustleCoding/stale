@@ -802,6 +802,7 @@ struct RingSeg {
 
   // Keeping the index fresh: FSEvents since the saved event id, then live while the app is open.
   std::unique_ptr<FsWatcher> _watcher;
+  int _watchGeneration;  // bumped whenever the watcher is replaced; late batches of an old one are dropped
   dispatch_queue_t _fsQueue;
   std::vector<RefreshRequest> _pendingChanges;
   uint64_t _pendingEventId;
@@ -1589,6 +1590,7 @@ struct RingSeg {
   [self endScanUI];
   _scanPath = _resultPath.empty() ? _scanPath : _resultPath;
   [self updateStatusPill];
+  if (!_pendingChanges.empty()) [self runRefresh];  // changes queued while the scan ran
   if (!_model.result || _model.result->dirs.empty()) {
     [self showEmpty:@"Indexing stopped"
                hint:@"Nothing was saved. Press Rescan to index, or open a smaller folder."
@@ -1669,6 +1671,7 @@ struct RingSeg {
 // ───── keeping the index fresh ─────
 
 - (void)stopWatching {
+  ++_watchGeneration;
   _watcher.reset();
   [_refreshTimer invalidate];
   _refreshTimer = nil;
@@ -1682,14 +1685,14 @@ struct RingSeg {
   [self stopWatching];
   if (!_model.result || _model.result->dirs.empty() || _model.meta.eventId == 0) return;
   if (!_fsQueue) _fsQueue = dispatch_queue_create("app.stale.fsevents", DISPATCH_QUEUE_SERIAL);
-  int gen = _scanGeneration;
+  int gen = _watchGeneration;
   __weak StaleController* weakSelf = self;
   _watcher = std::make_unique<FsWatcher>(_resultPath, _model.meta.eventId, 2.0, _fsQueue, [weakSelf, gen](FsBatch b) {
     // Batches arrive on _fsQueue; the model is only touched on the main thread.
     auto shared = std::make_shared<FsBatch>(std::move(b));
     dispatch_async(dispatch_get_main_queue(), ^{
       StaleController* s = weakSelf;
-      if (s && gen == s->_scanGeneration) [s fsBatch:*shared];
+      if (s && gen == s->_watchGeneration) [s fsBatch:*shared];
     });
   });
   if (!_watcher->running()) _watcher.reset();
@@ -1697,7 +1700,7 @@ struct RingSeg {
 
 - (void)fsBatch:(FsBatch&)b {
   if (b.needFullScan) {
-    [self scanPath:_resultPath];
+    if (!_scanning) [self scanPath:_resultPath];  // a scan already running will pick up the new position
     return;
   }
   if (b.historyDone) _historyDone = YES;
@@ -1748,7 +1751,7 @@ struct RingSeg {
   // Small live updates finish in milliseconds and shouldn't flicker the pill; long ones show.
   [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(updateStatusPill) object:nil];
   [self performSelector:@selector(updateStatusPill) withObject:nil afterDelay:1.0];
-  int gen = _scanGeneration;
+  int gen = _watchGeneration;
   auto res = _model.result;  // spotlight is only written by applyRefresh, which waits for us
   auto planPtr = std::make_shared<RefreshPlan>(std::move(plan));
   std::string root = _resultPath;
@@ -1758,7 +1761,7 @@ struct RingSeg {
     auto patch = std::make_shared<RefreshPatch>(collectRefresh(o, *planPtr, res->spotlight));
     dispatch_async(dispatch_get_main_queue(), ^{
       self->_refreshing = NO;
-      if (gen != self->_scanGeneration || self->_model.result != res) return;
+      if (gen != self->_watchGeneration || self->_model.result != res) return;
       std::unordered_set<int32_t> touched;
       for (const RefreshJob& j : planPtr->jobs) touched.insert(j.id);
       if (applyRefresh(*res, std::move(*patch))) {
