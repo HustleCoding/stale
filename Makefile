@@ -29,7 +29,7 @@ NOTARY_PROFILE ?= stale
 # app builds without its "Check for Updates…" item (e.g. local/dev builds).
 SPARKLE_VERSION = 2.10.0
 SPARKLE_SHA256 = c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c
-SPARKLE_PUBLIC_KEY ?=
+SPARKLE_PUBLIC_KEY ?= P+6QxTZeKqPsGYamKkuCQYwshob+0i/Ck0E8SLBX9nM=
 SPARKLE_FEED = https://github.com/HustleCoding/stale/releases/latest/download/appcast.xml
 SPARKLE_DIR = $(BUILD)/Sparkle-$(SPARKLE_VERSION)
 SPARKLE_FW = $(SPARKLE_DIR)/Sparkle.framework
