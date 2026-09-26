@@ -830,6 +830,7 @@ struct RingSeg {
   NSProgressIndicator* _emptySpinner;
   NSTimer* _finderTimer;
   NSButton* _emptyTrashButton;
+  NSButton* _undoButton;
   std::string _scanPath;    // root being (or last asked to be) indexed
   std::string _resultPath;  // root the current model describes
   std::shared_ptr<std::atomic<uint64_t>> _progress;
@@ -965,6 +966,9 @@ struct RingSeg {
   NSMenuItem* editItem = [NSMenuItem new];
   [menubar addItem:editItem];
   NSMenu* edit = [[NSMenu alloc] initWithTitle:@"Edit"];
+  [edit addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
+  [edit addItemWithTitle:@"Redo" action:@selector(redo:) keyEquivalent:@"Z"];
+  [edit addItem:NSMenuItem.separatorItem];
   [edit addItemWithTitle:@"Copy Path" action:@selector(copyPath:) keyEquivalent:@"c"];
   [edit addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
   editItem.submenu = edit;
@@ -1363,7 +1367,9 @@ struct RingSeg {
   _revealButton.enabled = _trashButton.enabled = NO;
   _emptyTrashButton = [NSButton buttonWithTitle:@"Empty Trash…" target:self action:@selector(emptyTrash:)];
   _emptyTrashButton.hidden = YES;
-  NSStackView* bottom = [NSStackView stackViewWithViews:@[ _status, _revealButton, _trashButton, _emptyTrashButton ]];
+  _undoButton = [NSButton buttonWithTitle:@"Undo" target:self action:@selector(undoTrash:)];
+  _undoButton.hidden = YES;
+  NSStackView* bottom = [NSStackView stackViewWithViews:@[ _status, _undoButton, _revealButton, _trashButton, _emptyTrashButton ]];
   bottom.orientation = NSUserInterfaceLayoutOrientationHorizontal;
   bottom.spacing = 10;
   [_status setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
@@ -2522,6 +2528,7 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
 }
 
 - (void)showMode:(Mode)m {
+  if (_mode != m) _undoButton.hidden = YES;
   // Coming back to a page whose folder was protected: access may have been granted since, look again.
   if (_mode != m && isFinderMode(m) && _finderUnreadable[(int)m]) _finderItems[(int)m] = nil;
   _mode = m;
@@ -2981,8 +2988,10 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
   // note
   NSTableCellView* v = [self cellWithId:@"noteCell" inView:ov image:NO size:NO];
   NSMutableArray<NSString*>* parts = [NSMutableArray new];
+  v.toolTip = nil;
   if (item.note.length && !item.parent) {
     v.textField.stringValue = item.note;
+    v.toolTip = item.note;
     v.textField.textColor = item.suggested ? NSColor.secondaryLabelColor : NSColor.systemGreenColor;
     if (_mode != Mode::Duplicates) v.textField.textColor = NSColor.secondaryLabelColor;
     return v;
@@ -3034,6 +3043,7 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
 }
 
 - (void)selectionChanged {
+  _undoButton.hidden = YES;
   NSArray<Item*>* sel = [self selectedItems];
   uint64_t total = 0;
   for (Item* it in sel) total += it.size;
@@ -3055,8 +3065,10 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
         : [NSString stringWithFormat:@"%@ selected  ·  %@", fmtCount(sel.count, @"item"), fmtBytes(total)];
   } else if (sel.count == 1) {
     Item* it = sel[0];
-    _status.stringValue = [NSString stringWithFormat:@"%@  ·  %@  ·  last used %@", it.path.stringByAbbreviatingWithTildeInPath,
-                                                     fmtBytes(it.size), [fmtAgo(it.lastUsed, _model.now) lowercaseString]];
+    NSString* why = [self reasonFor:it];
+    _status.stringValue = why ? [NSString stringWithFormat:@"%@  ·  %@  ·  %@", it.path.stringByAbbreviatingWithTildeInPath, fmtBytes(it.size), why]
+                              : [NSString stringWithFormat:@"%@  ·  %@  ·  last used %@", it.path.stringByAbbreviatingWithTildeInPath,
+                                                           fmtBytes(it.size), [fmtAgo(it.lastUsed, _model.now) lowercaseString]];
   } else {
     _status.stringValue = [NSString stringWithFormat:@"%@ selected  ·  %@", fmtCount(sel.count, @"item"), fmtBytes(total)];
   }
@@ -3173,6 +3185,8 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
       if (![fm removeItemAtPath:p error:&err])
         [failures addObject:[NSString stringWithFormat:@"%@: %@", it.name, err.localizedDescription ?: @"unknown error"]];
     }
+    [self->_window.undoManager removeAllActions];
+    self->_undoButton.hidden = YES;
     self->_finderItems[(int)Mode::Trash] = nil;
     if (self->_mode == Mode::Trash) [self showMode:Mode::Trash];
     else [self refreshFinderBadge:Mode::Trash];
@@ -3204,6 +3218,48 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
 
 - (void)selectAll:(id)sender { [_outline selectAll:sender]; }
 
+// One line on why an item is listed (and, when pre-ticked, why it is safe to remove).
+- (NSString*)reasonFor:(Item*)it {
+  if (it.note.length) return it.note;
+  if (it.isDir && categoryReclaimable(it.category) && categoryHint(it.category).length)
+    return [NSString stringWithFormat:@"%@, %@", categoryTitle(it.category), categoryHint(it.category)];
+  return nil;
+}
+
+- (void)undoTrash:(id)sender {
+  [_window.undoManager undo];
+}
+
+// Move items back from the Trash to where they were, then let the index pick them up again.
+- (void)putBack:(NSArray<NSArray<NSURL*>*>*)moves {
+  NSFileManager* fm = NSFileManager.defaultManager;
+  NSMutableArray<NSString*>* failures = [NSMutableArray new];
+  NSUInteger restored = 0;
+  for (NSArray<NSURL*>* m in moves) {
+    NSError* err = nil;
+    if ([fm moveItemAtURL:m[1] toURL:m[0] error:&err]) {
+      ++restored;
+      _pendingChanges.push_back(RefreshRequest{std_str(m[0].path.stringByDeletingLastPathComponent), false});
+    } else {
+      [failures addObject:[NSString stringWithFormat:@"%@: %@", m[0].lastPathComponent, err.localizedDescription ?: @"unknown error"]];
+    }
+  }
+  _undoButton.hidden = YES;
+  for (int i = 0; i < (int)Mode::Count; ++i)
+    if (isFinderMode((Mode)i) && !_finderRunning[i]) _finderItems[i] = nil;
+  _appItems = nil;
+  if (restored && _model.result && !_model.result->dirs.empty()) [self runRefresh];
+  if (isFinderMode(_mode) || _mode == Mode::Apps) [self showMode:_mode];
+  _status.stringValue = [NSString stringWithFormat:@"Put back %@ from the Trash.", fmtCount(restored, @"item")];
+  if (failures.count) {
+    NSAlert* a = [NSAlert new];
+    a.alertStyle = NSAlertStyleCritical;
+    a.messageText = @"Some items couldn't be put back";
+    a.informativeText = [failures componentsJoinedByString:@"\n"];
+    [a beginSheetModalForWindow:_window completionHandler:nil];
+  }
+}
+
 - (void)trashSelected:(id)sender {
   NSArray<Item*>* sel = [self selectedItems];
   if (!sel.count) return;
@@ -3224,6 +3280,17 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
   }
   if (anyRecent) [info appendString:@"\n\n⚠︎ Something here was used in the last 30 days."];
   else if (anyOwn) [info appendString:@"\n\nThis includes your own files, not just regenerable data."];
+  NSMutableArray<NSString*>* reasons = [NSMutableArray new];
+  for (Item* it in sel) {
+    NSString* why = [self reasonFor:it];
+    if (why) [reasons addObject:[NSString stringWithFormat:@"• %@ — %@", it.name, why]];
+  }
+  if (reasons.count) {
+    const NSUInteger shown = 5;
+    [info appendString:@"\n\n"];
+    [info appendString:[[reasons subarrayWithRange:NSMakeRange(0, MIN(shown, reasons.count))] componentsJoinedByString:@"\n"]];
+    if (reasons.count > shown) [info appendFormat:@"\n…and %@", fmtCount(reasons.count - shown, @"more item")];
+  }
   a.informativeText = info;
   [a addButtonWithTitle:@"Move to Trash"];
   [a addButtonWithTitle:@"Cancel"];
@@ -3237,9 +3304,13 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
   NSFileManager* fm = NSFileManager.defaultManager;
   uint64_t moved = 0;
   NSMutableArray<NSString*>* failures = [NSMutableArray new];
+  NSMutableArray<NSArray<NSURL*>*>* undo = [NSMutableArray new];  // [original, place in the Trash]
   for (Item* it in items) {
     NSError* err = nil;
-    if ([fm trashItemAtURL:[NSURL fileURLWithPath:it.path] resultingItemURL:nil error:&err]) {
+    NSURL* url = [NSURL fileURLWithPath:it.path];
+    NSURL* trashed = nil;
+    if ([fm trashItemAtURL:url resultingItemURL:&trashed error:&err]) {
+      if (trashed) [undo addObject:@[ url, trashed ]];
       moved += it.size;
       [self removeItem:it];
     } else {
@@ -3258,6 +3329,12 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
     if (moved) [self persistIndexSoon];
   }
   _status.stringValue = [NSString stringWithFormat:@"Moved %@ to the Trash.", fmtBytes(moved)];
+  if (undo.count) {
+    NSUndoManager* um = _window.undoManager;
+    [um registerUndoWithTarget:self handler:^(StaleController* s) { [s putBack:undo]; }];
+    [um setActionName:@"Move to Trash"];
+    _undoButton.hidden = NO;
+  }
   if (failures.count) {
     NSAlert* a = [NSAlert new];
     a.alertStyle = NSAlertStyleCritical;

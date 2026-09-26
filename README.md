@@ -80,6 +80,7 @@ disk, so APFS clones and sparse files aren't overcounted.
 ```sh
 make              # build/stale and build/Stale.app, universal
 make ARCHS=arm64  # quicker local build
+make test         # fixture tests for the scanner, index and cleanup rules
 make install      # /usr/local/bin/stale and /Applications/Stale.app
 ```
 

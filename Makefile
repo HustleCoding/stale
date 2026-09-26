@@ -51,6 +51,13 @@ all: $(BUILD)/stale $(APP_BIN)
 cli: $(BUILD)/stale
 app: $(APP_BIN)
 
+# Fixture tests for the scanner, index and cleanup finders (run on every PR in CI).
+test: $(BUILD)/stale_test
+	./$(BUILD)/stale_test
+
+$(BUILD)/stale_test: tests/stale_test.mm $(CORE) $(SRC)/scan.h $(SRC)/index.h $(SRC)/finders.h
+	$(CXX) $(OBJCXXFLAGS) $(ARCHFLAGS) -I$(SRC) tests/stale_test.mm $(CORE) $(LDFLAGS) -o $@
+
 $(BUILD)/stale: $(OBJS)
 	$(CXX) $(OBJS) $(LDFLAGS) -o $@
 	codesign -f $(SIGN_FLAGS) $@
@@ -156,4 +163,4 @@ uninstall:
 clean:
 	rm -rf $(BUILD) $(DIST)
 
-.PHONY: all cli app run dist notarize verify install uninstall clean
+.PHONY: all cli app test run dist notarize verify install uninstall clean
