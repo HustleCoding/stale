@@ -227,6 +227,7 @@ int cmdReport(const Args& a) {
 
   std::vector<const FileRec*> bigOld, neverOpened;
   for (const FileRec& f : r.bigFiles) {
+    if (f.size < kBigFileReport) continue;
     if (bucketFor(f.lastUsed, r.now) >= STALE) bigOld.push_back(&f);
     if (f.neverOpened) neverOpened.push_back(&f);
   }

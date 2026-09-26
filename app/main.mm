@@ -2,9 +2,10 @@
 // Sidebar of views (Overview, All folders, Safe to delete, Forgotten, Big unused files, Apps),
 // a folder tree with size / last-used / what-is-it columns, and a "Move to Trash" action.
 // The whole disk is indexed once and kept in ~/Library/Application Support/Stale; the app
-// opens from that index and only rescans when asked. Everything goes to the Trash, nothing
-// is deleted outright.
+// opens from that index, catches up on what changed meanwhile through FSEvents and keeps
+// following the disk while open. Everything goes to the Trash, nothing is deleted outright.
 #import <Cocoa/Cocoa.h>
+#import <Quartz/Quartz.h>
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -15,8 +16,11 @@
 #include <cmath>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
+#include "../src/finders.h"
+#include "../src/fsevents.h"
 #include "../src/index.h"
 #include "../src/scan.h"
 
@@ -213,7 +217,7 @@ static void fixSize(NSView* v, CGFloat w, CGFloat h) {
 
 // ───────────────────────────── model ─────────────────────────────
 
-@interface Item : NSObject
+@interface Item : NSObject <QLPreviewItem>
 @property(nonatomic, copy) NSString* name;
 @property(nonatomic, copy) NSString* path;
 @property(nonatomic) uint64_t size;
@@ -228,8 +232,19 @@ static void fixSize(NSView* v, CGFloat w, CGFloat h) {
 @property(nonatomic, weak) Item* parent;
 @property(nonatomic, strong) NSMutableArray<Item*>* children;  // nil until loaded
 @property(nonatomic, strong) NSImage* icon;
+// finder results
+@property(nonatomic, copy) NSString* note;  // why it is listed
+@property(nonatomic) int group;             // duplicates: copies of one file share a group, -1 otherwise
+@property(nonatomic) BOOL suggested;        // preselected for the Trash
 @end
 @implementation Item
+- (instancetype)init {
+  if ((self = [super init])) _group = -1;
+  return self;
+}
+// Quick Look
+- (NSURL*)previewItemURL { return [NSURL fileURLWithPath:_path]; }
+- (NSString*)previewItemTitle { return _name; }
 @end
 
 // Where the Apps view gets its bundles from: a subtree of the main index when the scanned
@@ -248,31 +263,8 @@ struct Model {
   AppSources apps;
   double now = 0;        // wall clock when the model was installed; ages are relative to this
   double indexedAt = 0;  // when the scan behind `result` finished
+  IndexMeta meta;        // FSEvents position the model is current to
 };
-
-// Walks root→leaf by path components; -1 when `path` isn't a directory of `r`.
-static int32_t findDir(const ScanResult& r, const std::string& path) {
-  if (r.dirs.empty()) return -1;
-  const std::string& root = r.dirs[0].path;
-  if (path == root) return 0;
-  std::string prefix = root.back() == '/' ? root : root + "/";
-  if (path.compare(0, prefix.size(), prefix) != 0) return -1;
-  int32_t cur = 0;
-  size_t pos = prefix.size();
-  for (;;) {
-    size_t next = path.find('/', pos);
-    if (next == std::string::npos) next = path.size();
-    int32_t found = -1;
-    for (int32_t c : r.dirs[cur].children) {
-      const std::string& cp = r.dirs[c].path;
-      if (cp.size() == next && path.compare(0, next, cp) == 0) { found = c; break; }
-    }
-    if (found < 0) return -1;
-    cur = found;
-    if (next == path.size()) return cur;
-    pos = next + 1;
-  }
-}
 
 // Resolve both app folders against `main`; scans (and caches) the ones it doesn't cover.
 static AppSources resolveApps(const std::shared_ptr<ScanResult>& main, const std::string& home,
@@ -303,7 +295,9 @@ static AppSources resolveApps(const std::shared_ptr<ScanResult>& main, const std
     *r = scan(ao);
     if (cancel && cancel->load()) continue;
     if (!r->dirs.empty()) {
-      saveIndex(indexPath(roots[i]), roots[i], *r, unixNow());
+      IndexMeta meta;
+      meta.savedAt = unixNow();
+      saveIndex(indexPath(roots[i]), roots[i], *r, meta);
       s.r = r;
       s.dirId = 0;
     }
@@ -311,7 +305,12 @@ static AppSources resolveApps(const std::shared_ptr<ScanResult>& main, const std
   return out;
 }
 
-enum class Mode { Overview = 0, Browse, Reclaim, Forgotten, BigFiles, Apps, Count };
+enum class Mode { Overview = 0, Browse, Reclaim, Duplicates, Leftovers, Downloads, Forgotten, BigFiles, Apps, Trash, Count };
+
+// Pages whose rows come from a finder that runs on demand, off the main thread.
+static bool isFinderMode(Mode m) {
+  return m == Mode::Duplicates || m == Mode::Leftovers || m == Mode::Downloads || m == Mode::Trash;
+}
 
 struct ModeInfo {
   NSString* title;
@@ -330,6 +329,18 @@ static const ModeInfo kModes[] = {
      @"Data that tools generate and can regenerate: npm packages, build output, caches, Xcode and "
      @"Docker data. Deleting it frees space without losing any of your own files.",
      @"Nothing to regenerate", @"No npm packages, build output, caches or Xcode data here."},
+    {@"Duplicates", @"doc.on.doc.fill",
+     @"Files of 4 MB or more that exist more than once with identical content (verified byte for byte). "
+     @"The most recently used copy of each is kept; the others are preselected.",
+     @"No duplicates", @"Every file over 4 MB exists only once."},
+    {@"Leftovers", @"puzzlepiece.extension.fill",
+     @"Settings, caches and containers in your Library that belong to apps no longer installed, "
+     @"plus old iPhone and iPad backups.",
+     @"No leftovers", @"Everything in your Library belongs to an installed app."},
+    {@"Old downloads", @"arrow.down.circle.fill",
+     @"Downloads not opened for 30 days. Installers whose app is already installed are preselected; "
+     @"have a look at the rest before you decide.",
+     @"Downloads are tidy", @"Nothing in ~/Downloads has sat there for 30 days."},
     {@"Forgotten", @"clock.arrow.circlepath",
      @"Folders of 50 MB or more where nothing has been opened or changed in over 6 months. "
      @"If you don't recognise one, you probably don't need it.",
@@ -342,6 +353,9 @@ static const ModeInfo kModes[] = {
      @"Apps in /Applications and ~/Applications by when you last launched them (from Spotlight). "
      @"Apps you never open can be removed and reinstalled later.",
      @"No apps found", @"Nothing in /Applications or ~/Applications."},
+    {@"Trash", @"trash.fill",
+     @"What's waiting in your Trash. Emptying it is the only step in Stale that deletes for good.",
+     @"The Trash is empty", @"Nothing to empty."},
 };
 
 // ───────────────────────────── views ─────────────────────────────
@@ -670,7 +684,38 @@ struct RingSeg {
 // ───────────────────────────── controller ─────────────────────────────
 
 @interface StaleController : NSObject <NSApplicationDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate,
-                                       NSToolbarDelegate, NSMenuDelegate>
+                                       NSToolbarDelegate, NSMenuDelegate, QLPreviewPanelDataSource, QLPreviewPanelDelegate>
+- (void)togglePreview:(id)sender;
+- (void)openSelected:(id)sender;
+@end
+
+// File list: Space previews, ⌘↓ opens, like the Finder.
+@interface FileOutlineView : NSOutlineView
+@end
+@implementation FileOutlineView
+- (void)keyDown:(NSEvent*)e {
+  StaleController* c = (StaleController*)NSApp.delegate;
+  NSString* chars = e.charactersIgnoringModifiers;
+  BOOL cmd = (e.modifierFlags & NSEventModifierFlagCommand) != 0;
+  if ([chars isEqual:@" "] && !cmd) {
+    [c togglePreview:self];
+    return;
+  }
+  if (cmd && chars.length == 1 && [chars characterAtIndex:0] == NSDownArrowFunctionKey) {
+    [c openSelected:self];
+    return;
+  }
+  [super keyDown:e];
+}
+- (BOOL)acceptsPreviewPanelControl:(QLPreviewPanel*)panel { return YES; }
+- (void)beginPreviewPanelControl:(QLPreviewPanel*)panel {
+  panel.dataSource = (StaleController*)NSApp.delegate;
+  panel.delegate = (StaleController*)NSApp.delegate;
+}
+- (void)endPreviewPanelControl:(QLPreviewPanel*)panel {
+  panel.dataSource = nil;
+  panel.delegate = nil;
+}
 @end
 
 @implementation StaleController {
@@ -731,6 +776,18 @@ struct RingSeg {
   NSArray<Item*>* _flat;  // items shown in non-browse modes
   NSMutableArray<Item*>* _appItems;
   Mode _mode;
+
+  // Finder pages: results are computed on first visit and kept until the index changes.
+  NSMutableArray<Item*>* _finderItems[(int)Mode::Count];
+  BOOL _finderRunning[(int)Mode::Count];
+  BOOL _finderUnreadable[(int)Mode::Count];  // the folder is TCC-protected; the empty list means nothing
+  int _finderGeneration;
+  std::shared_ptr<std::atomic<bool>> _finderCancel;
+  std::shared_ptr<std::atomic<uint64_t>> _finderProgress;
+  std::shared_ptr<std::atomic<uint64_t>> _finderProgressTotal;
+  NSProgressIndicator* _emptySpinner;
+  NSTimer* _finderTimer;
+  NSButton* _emptyTrashButton;
   std::string _scanPath;    // root being (or last asked to be) indexed
   std::string _resultPath;  // root the current model describes
   std::shared_ptr<std::atomic<uint64_t>> _progress;
@@ -742,6 +799,17 @@ struct RingSeg {
   NSString* _sortKey;
   BOOL _sortAscending;
   std::string _launchRoot;  // folder handed over by Finder/`open` before the window exists
+
+  // Keeping the index fresh: FSEvents since the saved event id, then live while the app is open.
+  std::unique_ptr<FsWatcher> _watcher;
+  int _watchGeneration;  // bumped whenever the watcher is replaced; late batches of an old one are dropped
+  dispatch_queue_t _fsQueue;
+  std::vector<RefreshRequest> _pendingChanges;
+  uint64_t _pendingEventId;
+  BOOL _historyDone;  // everything that happened while the app was closed has been delivered
+  BOOL _refreshing;   // a patch is being collected off the main thread
+  double _refreshStarted;
+  NSTimer* _refreshTimer;
 }
 
 // ───── app lifecycle ─────
@@ -768,6 +836,7 @@ struct RingSeg {
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)a { return YES; }
 
 - (void)applicationWillTerminate:(NSNotification*)n {
+  _watcher.reset();
   if (_persistTimer) {
     [_persistTimer invalidate];
     _persistTimer = nil;
@@ -822,9 +891,14 @@ struct RingSeg {
   [file addItemWithTitle:@"Rescan" action:@selector(rescan:) keyEquivalent:@"r"];
   [file addItemWithTitle:@"Stop Indexing" action:@selector(cancelScan:) keyEquivalent:@"."];
   [file addItem:NSMenuItem.separatorItem];
+  NSMenuItem* openIt = [file addItemWithTitle:@"Open" action:@selector(openSelected:) keyEquivalent:[NSString stringWithFormat:@"%C", (unichar)NSDownArrowFunctionKey]];
+  openIt.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+  [file addItemWithTitle:@"Quick Look" action:@selector(togglePreview:) keyEquivalent:@"y"];
   [file addItemWithTitle:@"Reveal in Finder" action:@selector(revealSelected:) keyEquivalent:@"R"];
+  [file addItem:NSMenuItem.separatorItem];
   NSMenuItem* trash = [file addItemWithTitle:@"Move to Trash" action:@selector(trashSelected:) keyEquivalent:@"\b"];
   trash.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+  [file addItemWithTitle:@"Empty Trash…" action:@selector(emptyTrash:) keyEquivalent:@""];
   [file addItem:NSMenuItem.separatorItem];
   [file addItemWithTitle:@"Close" action:@selector(performClose:) keyEquivalent:@"w"];
   fileItem.submenu = file;
@@ -841,7 +915,7 @@ struct RingSeg {
   NSMenu* view = [[NSMenu alloc] initWithTitle:@"View"];
   for (int i = 0; i < (int)Mode::Count; ++i) {
     NSMenuItem* mi = [view addItemWithTitle:kModes[i].title action:@selector(modeFromMenu:)
-                              keyEquivalent:[NSString stringWithFormat:@"%d", i + 1]];
+                              keyEquivalent:[NSString stringWithFormat:@"%d", (i + 1) % 10]];
     mi.tag = i;
   }
   [view addItem:NSMenuItem.separatorItem];
@@ -923,9 +997,14 @@ struct RingSeg {
   add(Mode::Browse, NO, nil);
   add(Mode::Overview, YES, @"Clean up");
   add(Mode::Reclaim, NO, nil);
+  add(Mode::Duplicates, NO, nil);
+  add(Mode::Leftovers, NO, nil);
+  add(Mode::Downloads, NO, nil);
+  add(Mode::Overview, YES, @"Review");
   add(Mode::Forgotten, NO, nil);
   add(Mode::BigFiles, NO, nil);
   add(Mode::Apps, NO, nil);
+  add(Mode::Trash, NO, nil);
   _entries = e;
 
   _sidebar = [NSOutlineView new];
@@ -1135,7 +1214,7 @@ struct RingSeg {
 }
 
 - (void)buildList {
-  _outline = [NSOutlineView new];
+  _outline = [FileOutlineView new];
   _outline.dataSource = self;
   _outline.delegate = self;
   _outline.allowsMultipleSelection = YES;
@@ -1188,10 +1267,19 @@ struct RingSeg {
   _emptyHint.textColor = NSColor.tertiaryLabelColor;
   _emptyHint.alignment = NSTextAlignmentCenter;
   _emptyHint.selectable = NO;
-  NSStackView* es = [NSStackView stackViewWithViews:@[ _emptyIcon, _emptyTitle, _emptyHint ]];
+  _emptySpinner = [NSProgressIndicator new];
+  _emptySpinner.style = NSProgressIndicatorStyleBar;
+  _emptySpinner.controlSize = NSControlSizeSmall;
+  _emptySpinner.indeterminate = YES;
+  _emptySpinner.minValue = 0;
+  _emptySpinner.maxValue = 1;
+  _emptySpinner.hidden = YES;
+  fixSize(_emptySpinner, 240, 0);
+  NSStackView* es = [NSStackView stackViewWithViews:@[ _emptyIcon, _emptyTitle, _emptyHint, _emptySpinner ]];
   es.orientation = NSUserInterfaceLayoutOrientationVertical;
   es.spacing = 6;
   [es setCustomSpacing:12 afterView:_emptyIcon];
+  [es setCustomSpacing:14 afterView:_emptyHint];
   es.translatesAutoresizingMaskIntoConstraints = NO;
   _empty = [NSView new];
   [_empty addSubview:es];
@@ -1213,7 +1301,9 @@ struct RingSeg {
   _trashButton.keyEquivalent = @"";
   _trashButton.bezelColor = NSColor.controlAccentColor;
   _revealButton.enabled = _trashButton.enabled = NO;
-  NSStackView* bottom = [NSStackView stackViewWithViews:@[ _status, _revealButton, _trashButton ]];
+  _emptyTrashButton = [NSButton buttonWithTitle:@"Empty Trash…" target:self action:@selector(emptyTrash:)];
+  _emptyTrashButton.hidden = YES;
+  NSStackView* bottom = [NSStackView stackViewWithViews:@[ _status, _revealButton, _trashButton, _emptyTrashButton ]];
   bottom.orientation = NSUserInterfaceLayoutOrientationHorizontal;
   bottom.spacing = 10;
   [_status setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
@@ -1289,6 +1379,8 @@ struct RingSeg {
 - (NSMenu*)makeContextMenu {
   NSMenu* m = [NSMenu new];
   m.delegate = self;
+  [m addItemWithTitle:@"Open" action:@selector(openSelected:) keyEquivalent:@""];
+  [m addItemWithTitle:@"Quick Look" action:@selector(togglePreview:) keyEquivalent:@""];
   [m addItemWithTitle:@"Reveal in Finder" action:@selector(revealSelected:) keyEquivalent:@""];
   [m addItemWithTitle:@"Copy Path" action:@selector(copyPath:) keyEquivalent:@""];
   [m addItem:NSMenuItem.separatorItem];
@@ -1339,8 +1431,8 @@ struct RingSeg {
 }
 
 - (BOOL)validateToolbarItem:(NSToolbarItem*)item {
-  if (item.action == @selector(trashSelected:) || item.action == @selector(revealSelected:))
-    return [self selectedItems].count > 0;
+  if (item.action == @selector(trashSelected:)) return _mode != Mode::Trash && [self selectedItems].count > 0;
+  if (item.action == @selector(revealSelected:)) return [self selectedItems].count > 0;
   if ([item.itemIdentifier isEqual:@"rescan"]) {
     // Doubles as the Stop button while indexing.
     BOOL busy = _scanning;
@@ -1354,8 +1446,11 @@ struct RingSeg {
 
 - (BOOL)validateMenuItem:(NSMenuItem*)item {
   SEL a = item.action;
-  if (a == @selector(trashSelected:) || a == @selector(revealSelected:) || a == @selector(copyPath:))
+  if (a == @selector(trashSelected:)) return _mode != Mode::Trash && [self selectedItems].count > 0;
+  if (a == @selector(revealSelected:) || a == @selector(copyPath:) || a == @selector(openSelected:) ||
+      a == @selector(togglePreview:))
     return [self selectedItems].count > 0;
+  if (a == @selector(emptyTrash:)) return !_scanning && !_loading && !_finderUnreadable[(int)Mode::Trash];
   if (a == @selector(modeFromMenu:)) item.state = item.tag == (NSInteger)_mode ? NSControlStateValueOn : NSControlStateValueOff;
   if (a == @selector(cancelScan:)) return _scanning;
   if (a == @selector(rescan:) || a == @selector(chooseFolder:) || a == @selector(openHome:) || a == @selector(openDisk:))
@@ -1414,15 +1509,18 @@ struct RingSeg {
   std::string home = std_str(NSHomeDirectory());
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
     auto res = std::make_shared<ScanResult>();
-    double saved = 0;
-    bool ok = loadIndex(indexPath(root), root, *res, &saved);
+    IndexMeta meta;
+    bool ok = loadIndex(indexPath(root), root, *res, &meta);
     AppSources apps;
     if (ok) apps = resolveApps(res, home, nullptr);
+    // fseventsd rebuilt its database (or the disk was replaced): the saved position means
+    // nothing, so the index has to be rebuilt. The old one stays on screen meanwhile.
+    bool stalePosition = ok && (meta.eventId == 0 || meta.volumeUUIDs != volumeUUIDs(root));
     dispatch_async(dispatch_get_main_queue(), ^{
       if (gen != self->_scanGeneration) return;
       self->_loading = NO;
-      if (ok) [self installResult:res apps:apps indexedAt:saved];
-      else [self scanPath:root];
+      if (ok) [self installResult:res apps:apps meta:meta];
+      if (!ok || stalePosition) [self scanPath:root];
     });
   });
 }
@@ -1461,22 +1559,26 @@ struct RingSeg {
   auto progressPtr = _progress;
   std::string home = std_str(NSHomeDirectory());
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    // Anything that changes during the scan is replayed from here afterwards.
+    IndexMeta meta;
+    meta.eventId = currentEventId();
+    meta.volumeUUIDs = volumeUUIDs(path);
     ScanOptions o;
     o.root = path;
     o.progressFiles = progressPtr.get();
     o.cancel = cancelPtr.get();
     auto res = std::make_shared<ScanResult>(scan(o));
     if (cancelPtr->load()) return;  // cancelScan already restored the UI
-    double finished = unixNow();
+    meta.savedAt = unixNow();
     AppSources apps;
     if (!res->dirs.empty()) {
-      saveIndex(indexPath(path), path, *res, finished);  // only complete scans are remembered
+      saveIndex(indexPath(path), path, *res, meta);  // only complete scans are remembered
       apps = resolveApps(res, home, cancelPtr.get());
     }
     if (cancelPtr->load()) return;
     dispatch_async(dispatch_get_main_queue(), ^{
       if (gen != self->_scanGeneration) return;
-      [self installResult:res apps:apps indexedAt:finished];
+      [self installResult:res apps:apps meta:meta];
     });
   });
 }
@@ -1488,6 +1590,7 @@ struct RingSeg {
   [self endScanUI];
   _scanPath = _resultPath.empty() ? _scanPath : _resultPath;
   [self updateStatusPill];
+  if (!_pendingChanges.empty()) [self runRefresh];  // changes queued while the scan ran
   if (!_model.result || _model.result->dirs.empty()) {
     [self showEmpty:@"Indexing stopped"
                hint:@"Nothing was saved. Press Rescan to index, or open a smaller folder."
@@ -1504,6 +1607,7 @@ struct RingSeg {
 }
 
 - (void)clearModel {
+  [self stopWatching];
   _model = Model();
   _root = nil;
   _flat = @[];
@@ -1515,13 +1619,15 @@ struct RingSeg {
   [self reloadSidebarBadges];
 }
 
-- (void)installResult:(std::shared_ptr<ScanResult>)res apps:(AppSources)apps indexedAt:(double)at {
+- (void)installResult:(std::shared_ptr<ScanResult>)res apps:(AppSources)apps meta:(const IndexMeta&)meta {
   [self endScanUI];
+  [self stopWatching];
   _resultPath = _scanPath;
   _model.result = res;
   _model.apps = apps;
   _model.now = unixNow();
-  _model.indexedAt = at;
+  _model.indexedAt = meta.savedAt;
+  _model.meta = meta;
   const ScanResult& r = *res;
   if (r.dirs.empty()) {
     _root = nil;
@@ -1538,9 +1644,193 @@ struct RingSeg {
   _root = [self itemForDir:0 parent:nil];
   _fdaBanner.hidden = r.errors < 20;
   _appItems = nil;
+  [self dropFinderResults:YES];
   [self refreshSummary];
-  [self updateStatusPill];
   [self showMode:_mode];
+  [self startWatching];
+  [self updateStatusPill];
+}
+
+// Forget finder results so the next visit recomputes them. Duplicates are expensive (they
+// hash files), so a small incremental refresh keeps them; a new index drops everything.
+- (void)dropFinderResults:(BOOL)all {
+  for (int i = 0; i < (int)Mode::Count; ++i) {
+    if (!isFinderMode((Mode)i)) continue;
+    // The page on screen keeps its rows (they're filtered against the disk anyway) rather
+    // than flashing on every live update.
+    if (!all && ((Mode)i == Mode::Duplicates || (Mode)i == _mode || _finderRunning[i])) continue;
+    _finderItems[i] = nil;
+  }
+  if (!all) return;
+  if (_finderCancel) _finderCancel->store(true);
+  _finderCancel = nullptr;
+  for (int i = 0; i < (int)Mode::Count; ++i) _finderRunning[i] = NO;
+  ++_finderGeneration;
+}
+
+// ───── keeping the index fresh ─────
+
+- (void)stopWatching {
+  ++_watchGeneration;
+  _watcher.reset();
+  [_refreshTimer invalidate];
+  _refreshTimer = nil;
+  _pendingChanges.clear();
+  _pendingEventId = 0;
+  _historyDone = NO;
+}
+
+// Replay what changed since the index was saved, then follow the disk live.
+- (void)startWatching {
+  [self stopWatching];
+  if (!_model.result || _model.result->dirs.empty() || _model.meta.eventId == 0) return;
+  if (!_fsQueue) _fsQueue = dispatch_queue_create("app.stale.fsevents", DISPATCH_QUEUE_SERIAL);
+  int gen = _watchGeneration;
+  __weak StaleController* weakSelf = self;
+  _watcher = std::make_unique<FsWatcher>(_resultPath, _model.meta.eventId, 2.0, _fsQueue, [weakSelf, gen](FsBatch b) {
+    // Batches arrive on _fsQueue; the model is only touched on the main thread.
+    auto shared = std::make_shared<FsBatch>(std::move(b));
+    dispatch_async(dispatch_get_main_queue(), ^{
+      StaleController* s = weakSelf;
+      if (s && gen == s->_watchGeneration) [s fsBatch:*shared];
+    });
+  });
+  if (!_watcher->running()) _watcher.reset();
+}
+
+- (void)fsBatch:(FsBatch&)b {
+  if (b.needFullScan) {
+    if (!_scanning) [self scanPath:_resultPath];  // a scan already running will pick up the new position
+    return;
+  }
+  if (b.historyDone) _historyDone = YES;
+  // Writing our own index file is a change too; following it would re-read and re-write forever.
+  std::string own = indexDir();
+  for (auto& c : b.changes) {
+    c.path = normalizeEventPath(std::move(c.path));
+    if (c.subtree || c.path != own) _pendingChanges.push_back(std::move(c));
+  }
+  _pendingEventId = std::max(_pendingEventId, b.lastEventId);
+  [_refreshTimer invalidate];
+  __weak StaleController* weakSelf = self;
+  // During the replay events arrive in quick succession; wait for a lull before re-reading.
+  _refreshTimer = [NSTimer scheduledTimerWithTimeInterval:_historyDone ? 0.3 : 0.8 repeats:NO block:^(NSTimer*) {
+    StaleController* s = weakSelf;
+    if (!s) return;
+    s->_refreshTimer = nil;
+    [s runRefresh];
+  }];
+  [self updateStatusPill];
+}
+
+- (void)runRefresh {
+  if (_scanning || _loading || _refreshing || !_model.result || _model.result->dirs.empty()) return;
+  if (_pendingChanges.empty()) {
+    [self updateStatusPill];
+    return;
+  }
+  std::vector<RefreshRequest> changes = std::move(_pendingChanges);
+  _pendingChanges.clear();
+  uint64_t eventId = _pendingEventId;
+  RefreshPlan plan = planRefresh(*_model.result, std::move(changes));
+  if (plan.tooMuch) {
+    [self scanPath:_resultPath];
+    return;
+  }
+  if (plan.jobs.empty()) {
+    if (eventId > _model.meta.eventId) {
+      _model.meta.eventId = eventId;
+      [self persistIndexAfter:30];
+    }
+    [self updateStatusPill];
+    return;
+  }
+  _refreshing = YES;
+  _refreshStarted = CACurrentMediaTime();
+  [self updateStatusPill];
+  // Small live updates finish in milliseconds and shouldn't flicker the pill; long ones show.
+  [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(updateStatusPill) object:nil];
+  [self performSelector:@selector(updateStatusPill) withObject:nil afterDelay:1.0];
+  int gen = _watchGeneration;
+  auto res = _model.result;  // spotlight is only written by applyRefresh, which waits for us
+  auto planPtr = std::make_shared<RefreshPlan>(std::move(plan));
+  std::string root = _resultPath;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    ScanOptions o;
+    o.root = root;
+    auto patch = std::make_shared<RefreshPatch>(collectRefresh(o, *planPtr, res->spotlight));
+    dispatch_async(dispatch_get_main_queue(), ^{
+      self->_refreshing = NO;
+      if (gen != self->_watchGeneration || self->_model.result != res) return;
+      std::unordered_set<int32_t> touched;
+      for (const RefreshJob& j : planPtr->jobs) touched.insert(j.id);
+      if (applyRefresh(*res, std::move(*patch))) {
+        self->_model.meta.eventId = std::max(self->_model.meta.eventId, eventId);
+        [self modelChanged:touched];
+        [self persistIndexAfter:30];
+      }
+      if (!self->_pendingChanges.empty()) [self runRefresh];
+      else [self updateStatusPill];
+    });
+  });
+}
+
+// The scan model changed underneath the UI (refresh or trash): bring items and pages in line
+// while keeping expansion, selection and scroll position.
+- (void)modelChanged:(const std::unordered_set<int32_t>&)touched {
+  const ScanResult& r = *_model.result;
+  _fdaBanner.hidden = r.errors < 20;
+  _appItems = nil;
+  if (!isFinderMode(_mode) || !_finderRunning[(int)_mode]) [self dropFinderResults:NO];
+  NSMutableSet<NSString*>* selected = [NSMutableSet new];
+  for (Item* it in [self selectedItems]) [selected addObject:it.path];
+  if (_root) [self syncItem:_root touched:touched];
+  if (_mode != Mode::Browse && _mode != Mode::Overview) _flat = [self flatItemsForMode:_mode];
+  [self refreshSummary];
+  if (_mode != Mode::Overview) {
+    [_outline reloadData];
+    NSMutableIndexSet* rows = [NSMutableIndexSet new];
+    for (NSInteger i = 0; i < _outline.numberOfRows; ++i)
+      if ([selected containsObject:((Item*)[_outline itemAtRow:i]).path]) [rows addIndex:(NSUInteger)i];
+    [_outline selectRowIndexes:rows byExtendingSelection:NO];
+    [self selectionChanged];
+    BOOL empty = [self topItems].count == 0;
+    if (empty != _scroll.hidden) [self showMode:_mode];
+  }
+}
+
+// Update a loaded item (and its loaded descendants) from the model; re-list the files of
+// folders that were re-read.
+- (void)syncItem:(Item*)it touched:(const std::unordered_set<int32_t>&)touched {
+  const ScanResult& r = *_model.result;
+  if (it.dirId >= 0) {
+    const DirNode& d = r.dirs[(size_t)it.dirId];
+    it.size = d.size;
+    it.files = d.files;
+    it.lastUsed = d.lastUsed;
+    it.category = d.category;
+    it.never = d.size > 0 && d.neverOpenedSize * 2 > d.size;
+  }
+  if (!it.children) return;
+  BOOL relist = it.dirId >= 0 && touched.count(it.dirId) > 0;
+  NSMutableArray<Item*>* kids = [NSMutableArray new];
+  std::unordered_set<int32_t> present;
+  for (Item* k in it.children) {
+    if (k.dirId >= 0) {
+      if (r.dirs[(size_t)k.dirId].path.empty()) continue;  // gone
+      present.insert(k.dirId);
+      [self syncItem:k touched:touched];
+      [kids addObject:k];
+    } else if (!relist && access(k.path.fileSystemRepresentation, F_OK) == 0) {
+      [kids addObject:k];
+    }
+  }
+  if (it.dirId >= 0)
+    for (int32_t c : r.dirs[(size_t)it.dirId].children)
+      if (!r.dirs[(size_t)c].path.empty() && !present.count(c)) [kids addObject:[self itemForDir:c parent:it]];
+  if (relist) [kids addObjectsFromArray:[self fileItemsIn:it]];
+  [self sortItems:kids];
+  it.children = kids;
 }
 
 - (NSString*)titleForRoot:(const std::string&)root {
@@ -1566,14 +1856,26 @@ struct RingSeg {
     _statusStop.hidden = YES;
     _statusText.stringValue = @"Opening index…";
     _statusPill.toolTip = @"";
+  } else if (have && _watcher &&
+             (!_historyDone || (_refreshing && CACurrentMediaTime() - _refreshStarted >= 1.0))) {
+    _statusPill.hidden = NO;
+    _statusIcon.hidden = YES;
+    [_statusSpinner startAnimation:nil];
+    _statusStop.hidden = YES;
+    _statusText.stringValue = @"Updating…";
+    _statusPill.toolTip = @"Re-reading the folders that changed since the index was saved.";
   } else if (have) {
     const ScanResult& r = *_model.result;
+    BOOL live = _watcher != nullptr;
     _statusPill.hidden = NO;
     _statusIcon.hidden = NO;
+    _statusIcon.image = symbol(live ? @"checkmark.circle.fill" : @"clock", 11, NSFontWeightSemibold);
+    _statusIcon.contentTintColor = live ? NSColor.systemGreenColor : NSColor.secondaryLabelColor;
     [_statusSpinner stopAnimation:nil];
     _statusStop.hidden = YES;
-    _statusText.stringValue = [NSString stringWithFormat:@"Indexed %@", fmtIndexedAgo(_model.indexedAt, unixNow())];
-    _statusPill.toolTip = [NSString stringWithFormat:@"%@\n%@ · scanned in %.1f s%@\nRescan (⌘R) to refresh.",
+    _statusText.stringValue = live ? @"Up to date" : [NSString stringWithFormat:@"Indexed %@", fmtIndexedAgo(_model.indexedAt, unixNow())];
+    _statusPill.toolTip = [NSString stringWithFormat:@"%@%@\n%@ · scanned in %.1f s%@\nRescan (⌘R) to rebuild from scratch.",
+                                                     live ? @"Following changes on the disk. Indexed " : @"Indexed ",
                                                      fmtDateTime(_model.indexedAt), fmtCount(r.dirs[0].files, @"file"), r.seconds,
                                                      r.errors ? [NSString stringWithFormat:@" · %@ unreadable", fmtCount(r.errors, @"folder")] : @""];
   } else {
@@ -1593,10 +1895,15 @@ struct RingSeg {
 
 // Trashing edits the in-memory model; write it back so the next launch matches. Debounced,
 // encoded on the main thread (tens of ms) and written off it.
-- (void)persistIndexSoon {
+- (void)persistIndexSoon { [self persistIndexAfter:1.5]; }
+
+// Live updates are written lazily (the disk changes all the time, the index is tens of MB); an
+// earlier deadline already pending is kept.
+- (void)persistIndexAfter:(NSTimeInterval)delay {
+  if (_persistTimer && _persistTimer.fireDate.timeIntervalSinceNow <= delay) return;
   [_persistTimer invalidate];
   __weak StaleController* weakSelf = self;
-  _persistTimer = [NSTimer scheduledTimerWithTimeInterval:1.5 repeats:NO block:^(NSTimer*) {
+  _persistTimer = [NSTimer scheduledTimerWithTimeInterval:delay repeats:NO block:^(NSTimer*) {
     StaleController* s = weakSelf;
     if (!s) return;
     s->_persistTimer = nil;
@@ -1606,7 +1913,9 @@ struct RingSeg {
 
 - (void)persistIndexNow {
   if (!_model.result || _model.result->dirs.empty() || _resultPath.empty()) return;
-  std::string bytes = encodeIndex(_resultPath, *_model.result, _model.indexedAt);
+  IndexMeta meta = _model.meta;
+  meta.savedAt = _model.indexedAt;
+  std::string bytes = encodeIndex(_resultPath, *_model.result, meta);
   std::string file = indexPath(_resultPath);
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ writeIndex(file, bytes); });
 }
@@ -1645,7 +1954,7 @@ struct RingSeg {
   uint64_t bigBytes = 0;
   size_t bigCount = 0;
   for (const FileRec& f : r.bigFiles)
-    if (bucketFor(f.lastUsed, _model.now) >= STALE) { bigBytes += f.size; ++bigCount; }
+    if (f.size >= kBigFileReport && bucketFor(f.lastUsed, _model.now) >= STALE) { bigBytes += f.size; ++bigCount; }
   if (!_appItems) [self buildAppItems];
   uint64_t appBytes = 0, unusedAppBytes = 0;
   size_t unusedApps = 0;
@@ -1680,7 +1989,7 @@ struct RingSeg {
       case Mode::Forgotten: e.badge = fmtBytes(forgottenBytes); break;
       case Mode::BigFiles: e.badge = fmtBytes(bigBytes); break;
       case Mode::Apps: e.badge = fmtBytes(appBytes); break;
-      default: e.badge = nil;
+      default: if (!isFinderMode(e.mode)) e.badge = nil;
     }
   }
   [self reloadSidebarBadges];
@@ -1921,7 +2230,15 @@ struct RingSeg {
       [kids addObject:[self itemForDir:c parent:item]];
     }
   }
-  // Files are not kept in the index; list them now.
+  [kids addObjectsFromArray:[self fileItemsIn:item]];
+  item.children = kids;
+  [self sortItems:kids];
+}
+
+// Files are not kept in the index; list them now.
+- (NSArray<Item*>*)fileItemsIn:(Item*)item {
+  NSMutableArray<Item*>* kids = [NSMutableArray new];
+  const ScanResult& r = *_model.result;
   if (DIR* dp = opendir(item.path.fileSystemRepresentation)) {
     struct stat st;
     while (struct dirent* de = readdir(dp)) {
@@ -1944,15 +2261,19 @@ struct RingSeg {
     }
     closedir(dp);
   }
-  item.children = kids;
-  [self sortItems:kids];
+  return kids;
 }
 
 - (void)sortItems:(NSMutableArray<Item*>*)items {
   NSString* key = _sortKey;
   BOOL asc = _sortAscending;
+  BOOL grouped = items.count > 0 && items[0].group >= 0;  // duplicates stay together, kept copy first
   [items sortUsingComparator:^NSComparisonResult(Item* a, Item* b) {
     NSComparisonResult r;
+    if (grouped) {
+      if (a.group != b.group) return a.group < b.group ? NSOrderedAscending : NSOrderedDescending;
+      if (a.suggested != b.suggested) return a.suggested ? NSOrderedDescending : NSOrderedAscending;
+    }
     if ([key isEqual:@"name"]) r = [a.name localizedStandardCompare:b.name];
     else if ([key isEqual:@"lastUsed"]) r = a.lastUsed < b.lastUsed ? NSOrderedAscending : a.lastUsed > b.lastUsed ? NSOrderedDescending : NSOrderedSame;
     else r = a.size < b.size ? NSOrderedAscending : a.size > b.size ? NSOrderedDescending : NSOrderedSame;
@@ -1991,6 +2312,8 @@ struct RingSeg {
 }
 
 - (void)showMode:(Mode)m {
+  // Coming back to a page whose folder was protected: access may have been granted since, look again.
+  if (_mode != m && isFinderMode(m) && _finderUnreadable[(int)m]) _finderItems[(int)m] = nil;
   _mode = m;
   [self syncSidebar];
   const ModeInfo& mi = kModes[(int)m];
@@ -2025,7 +2348,154 @@ struct RingSeg {
     return;
   }
 
+  _overviewScroll.hidden = YES;
+  _listBox.hidden = NO;
+  _emptyTrashButton.hidden = m != Mode::Trash;
+  _trashButton.hidden = m == Mode::Trash;
+  if (isFinderMode(m) && !_finderItems[(int)m]) {
+    _flat = @[];
+    [_outline reloadData];
+    [self selectionChanged];
+    [self showFinderProgress];
+    [self runFinder:m];
+    return;
+  }
+  _emptySpinner.hidden = YES;
+  [_finderTimer invalidate];
+  _finderTimer = nil;
+
+  _flat = [self flatItemsForMode:m];
+  [_outline reloadData];
+  [_outline deselectAll:nil];
+  if (isFinderMode(m)) [self selectSuggested];
+  [self selectionChanged];
+
+  BOOL empty = [self topItems].count == 0;
+  _scroll.hidden = empty;
+  [_outline sizeLastColumnToFit];
+  if (!empty) [_window makeFirstResponder:_outline];
+  _bottom.hidden = empty;
+  _empty.hidden = !empty;
+  if (empty && isFinderMode(m) && _finderUnreadable[(int)m]) {
+    _emptyIcon.image = symbol(@"lock.shield", 40, NSFontWeightLight);
+    _emptyTitle.stringValue = [NSString stringWithFormat:@"Stale isn't allowed to see %@",
+                                                         m == Mode::Trash ? @"the Trash" : @"your Downloads"];
+    _emptyHint.stringValue = @"Give Stale Full Disk Access in System Settings › Privacy & Security, then open this page again.";
+  } else if (empty) {
+    _emptyIcon.image = symbol(m == Mode::Browse ? @"folder" : @"checkmark.circle", 40, NSFontWeightLight);
+    _emptyTitle.stringValue = mi.emptyTitle;
+    _emptyHint.stringValue = mi.emptyHint;
+  }
+}
+
+// ───── finder pages ─────
+
+- (void)showFinderProgress {
+  const ModeInfo& mi = kModes[(int)_mode];
+  _scroll.hidden = YES;
+  _bottom.hidden = YES;
+  _empty.hidden = NO;
+  _emptyIcon.image = symbol(mi.symbol, 40, NSFontWeightLight);
+  _emptyTitle.stringValue = [NSString stringWithFormat:@"Looking for %@…", mi.title.lowercaseString];
+  _emptyHint.stringValue = _mode == Mode::Duplicates ? @"Comparing files with the same size byte for byte. Large libraries take a moment."
+                                                     : @"This only takes a second.";
+  _emptySpinner.hidden = NO;
+  _emptySpinner.indeterminate = YES;
+  [_emptySpinner startAnimation:nil];
+}
+
+- (void)runFinder:(Mode)m {
+  if (_finderRunning[(int)m] || !_model.result || _model.result->dirs.empty()) return;
+  _finderRunning[(int)m] = YES;
+  int gen = _finderGeneration;
+  if (!_finderCancel) _finderCancel = std::make_shared<std::atomic<bool>>(false);
+  auto cancel = _finderCancel;
+  auto progress = std::make_shared<std::atomic<uint64_t>>(0);
+  auto progressTotal = std::make_shared<std::atomic<uint64_t>>(0);
+  _finderProgress = progress;
+  _finderProgressTotal = progressTotal;
+  auto res = _model.result;
+  std::string home = std_str(NSHomeDirectory());
+  double now = _model.now;
+  if (m == Mode::Duplicates) {
+    [_finderTimer invalidate];
+    __weak StaleController* weakSelf = self;
+    _finderTimer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer*) {
+      StaleController* s = weakSelf;
+      if (!s) return;
+      uint64_t total = progressTotal->load(), done = progress->load();
+      if (total == 0) return;
+      s->_emptySpinner.indeterminate = NO;
+      s->_emptySpinner.doubleValue = std::min(1.0, (double)done / (double)total);
+      s->_emptyHint.stringValue = [NSString stringWithFormat:@"Comparing %@ of %@ byte for byte.", fmtBytes(done), fmtBytes(total)];
+    }];
+  }
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    FinderOptions o;
+    o.index = res.get();
+    o.home = home;
+    o.now = now;
+    o.cancel = cancel.get();
+    o.progress = progress.get();
+    o.progressTotal = progressTotal.get();
+    FinderResult fr;
+    switch (m) {
+      case Mode::Duplicates: fr = findDuplicates(o); break;
+      case Mode::Leftovers: fr = findLeftovers(o); break;
+      case Mode::Downloads: fr = findOldDownloads(o); break;
+      case Mode::Trash: fr = findTrash(o); break;
+      default: break;
+    }
+    auto out = std::make_shared<FinderResult>(std::move(fr));
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (gen != self->_finderGeneration || cancel->load() || self->_model.result != res) return;
+      self->_finderRunning[(int)m] = NO;
+      NSMutableArray<Item*>* items = [NSMutableArray new];
+      for (const Found& f : out->items) {
+        Item* it = [Item new];
+        it.path = ns_str(f.path);
+        it.name = it.path.lastPathComponent;
+        it.size = f.size;
+        it.lastUsed = f.lastUsed;
+        it.isDir = f.isDir;
+        it.dirId = f.isDir && m != Mode::Trash ? findDir(*res, f.path) : -1;
+        it.files = it.dirId >= 0 ? res->dirs[(size_t)it.dirId].files : (f.isDir && m != Mode::Trash ? 1 : 0);
+        it.category = it.dirId >= 0 ? res->dirs[(size_t)it.dirId].category : CAT_NONE;
+        it.note = ns_str(f.note);
+        it.group = f.group;
+        it.suggested = f.preselect;
+        [items addObject:it];
+      }
+      self->_finderItems[(int)m] = items;
+      self->_finderUnreadable[(int)m] = out->unreadable;
+      [self refreshFinderBadge:m];
+      if (self->_mode == m) [self showMode:m];
+    });
+  });
+}
+
+- (void)refreshFinderBadge:(Mode)m {
+  uint64_t bytes = 0;
+  for (Item* it in _finderItems[(int)m]) bytes += m == Mode::Trash || it.suggested ? it.size : 0;
+  for (SidebarEntry* e in _entries)
+    if (!e.isGroup && e.mode == m)
+      e.badge = _finderItems[(int)m] && !_finderUnreadable[(int)m] && (bytes || _finderItems[(int)m].count == 0) ? fmtBytes(bytes) : nil;
+  [self reloadSidebarBadges];
+}
+
+- (void)selectSuggested {
+  NSMutableIndexSet* rows = [NSMutableIndexSet new];
+  for (NSInteger i = 0; i < _outline.numberOfRows; ++i)
+    if (((Item*)[_outline itemAtRow:i]).suggested) [rows addIndex:(NSUInteger)i];
+  [_outline selectRowIndexes:rows byExtendingSelection:NO];
+  if (rows.count) [_outline scrollRowToVisible:(NSInteger)rows.firstIndex];
+}
+
+// Rows of a list page, sorted the way the table currently is.
+- (NSMutableArray<Item*>*)flatItemsForMode:(Mode)m {
+  const ScanResult* r = _model.result.get();
   NSMutableArray<Item*>* flat = [NSMutableArray new];
+  if (!r || r->dirs.empty()) return flat;
   auto stillThere = [](const std::string& p) { return !p.empty() && access(p.c_str(), F_OK) == 0; };
   switch (m) {
     case Mode::Reclaim: {
@@ -2042,34 +2512,23 @@ struct RingSeg {
     }
     case Mode::BigFiles:
       for (const FileRec& f : r->bigFiles)
-        if (bucketFor(f.lastUsed, _model.now) >= STALE && stillThere(f.path))
+        if (f.size >= kBigFileReport && bucketFor(f.lastUsed, _model.now) >= STALE && stillThere(f.path))
           [flat addObject:[self itemForFile:f.path size:f.size lastUsed:f.lastUsed never:f.neverOpened parent:nil]];
       break;
     case Mode::Apps:
       if (!_appItems) [self buildAppItems];
       [flat addObjectsFromArray:_appItems ?: @[]];
       break;
+    case Mode::Duplicates:
+    case Mode::Leftovers:
+    case Mode::Downloads:
+    case Mode::Trash:
+      for (Item* it in _finderItems[(int)m]) if (stillThere(std_str(it.path))) [flat addObject:it];
+      break;
     default: break;
   }
   [self sortItems:flat];
-  _flat = flat;
-  [_outline reloadData];
-  [_outline deselectAll:nil];
-  [self selectionChanged];
-
-  BOOL empty = [self topItems].count == 0;
-  _overviewScroll.hidden = YES;
-  _listBox.hidden = NO;
-  _scroll.hidden = empty;
-  [_outline sizeLastColumnToFit];
-  if (!empty) [_window makeFirstResponder:_outline];
-  _bottom.hidden = empty;
-  _empty.hidden = !empty;
-  if (empty) {
-    _emptyIcon.image = symbol(m == Mode::Browse ? @"folder" : @"checkmark.circle", 40, NSFontWeightLight);
-    _emptyTitle.stringValue = mi.emptyTitle;
-    _emptyHint.stringValue = mi.emptyHint;
-  }
+  return flat;
 }
 
 - (void)syncSidebar {
@@ -2268,6 +2727,7 @@ struct RingSeg {
     v.imageView.image = item.icon;
     NSString* name = _mode == Mode::Browse || item.parent || item.isApp ? item.name : [item.path stringByAbbreviatingWithTildeInPath];
     if (_mode == Mode::Browse && !item.parent) name = displayName(item.path);
+    if (_mode == Mode::Trash && !item.parent) name = item.name;
     v.textField.stringValue = name;
     v.textField.textColor = NSColor.labelColor;
     v.toolTip = item.path;
@@ -2309,6 +2769,12 @@ struct RingSeg {
   // note
   NSTableCellView* v = [self cellWithId:@"noteCell" inView:ov image:NO size:NO];
   NSMutableArray<NSString*>* parts = [NSMutableArray new];
+  if (item.note.length && !item.parent) {
+    v.textField.stringValue = item.note;
+    v.textField.textColor = item.suggested ? NSColor.secondaryLabelColor : NSColor.systemGreenColor;
+    if (_mode != Mode::Duplicates) v.textField.textColor = NSColor.secondaryLabelColor;
+    return v;
+  }
   if (item.isApp) {
     [parts addObject:[NSString stringWithFormat:@"Installed or updated %@", [fmtAgo(item.installed, now) lowercaseString]]];
   } else if (item.isDir) {
@@ -2361,8 +2827,20 @@ struct RingSeg {
   for (Item* it in sel) total += it.size;
   BOOL any = sel.count > 0;
   _trashButton.enabled = _revealButton.enabled = any;
-  if (!any) {
+  if (_mode == Mode::Trash) {
+    uint64_t all = 0;
+    for (Item* it in _flat) all += it.size;
+    _emptyTrashButton.enabled = _flat.count > 0 && !_finderUnreadable[(int)Mode::Trash];
+    _status.stringValue = any ? [NSString stringWithFormat:@"%@ selected  ·  %@  ·  %@ in the Trash altogether", fmtCount(sel.count, @"item"), fmtBytes(total), fmtBytes(all)]
+                              : [NSString stringWithFormat:@"%@ in %@. Emptying deletes them for good.", fmtBytes(all), fmtCount(_flat.count, @"item")];
+  } else if (!any) {
     _status.stringValue = @"Select folders or files to move them to the Trash.";
+  } else if (isFinderMode(_mode) && sel.count > 1) {
+    NSUInteger suggested = 0;
+    for (Item* it in sel) suggested += it.suggested;
+    _status.stringValue = suggested == sel.count
+        ? [NSString stringWithFormat:@"%@ suggested  ·  %@  ·  review, then Move to Trash", fmtCount(sel.count, @"item"), fmtBytes(total)]
+        : [NSString stringWithFormat:@"%@ selected  ·  %@", fmtCount(sel.count, @"item"), fmtBytes(total)];
   } else if (sel.count == 1) {
     Item* it = sel[0];
     _status.stringValue = [NSString stringWithFormat:@"%@  ·  %@  ·  last used %@", it.path.stringByAbbreviatingWithTildeInPath,
@@ -2371,8 +2849,12 @@ struct RingSeg {
     _status.stringValue = [NSString stringWithFormat:@"%@ selected  ·  %@", fmtCount(sel.count, @"item"), fmtBytes(total)];
   }
   [_window.toolbar validateVisibleItems];
+  QLPreviewPanel* ql = QLPreviewPanel.sharedPreviewPanelExists ? QLPreviewPanel.sharedPreviewPanel : nil;
+  if (ql.visible && ql.dataSource == self) [ql reloadData];
 }
 
+// Folders expand, files open in their app, apps are shown in the Finder (launching them would
+// change the very "last used" date this list is about).
 - (void)doubleClicked:(id)sender {
   NSInteger row = _outline.clickedRow;
   if (row < 0) return;
@@ -2380,9 +2862,116 @@ struct RingSeg {
   if ([self outlineView:_outline isItemExpandable:it]) {
     if ([_outline isItemExpanded:it]) [_outline collapseItem:it];
     else [_outline expandItem:it];
-  } else {
+  } else if (it.isApp || it.isDir) {
     [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[ [NSURL fileURLWithPath:it.path] ]];
+  } else {
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:it.path]];
   }
+}
+
+- (void)openSelected:(id)sender {
+  for (Item* it in [self selectedItems]) {
+    NSURL* u = [NSURL fileURLWithPath:it.path];
+    if (it.isApp) [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[ u ]];
+    else [[NSWorkspace sharedWorkspace] openURL:u];
+  }
+}
+
+// ───── Quick Look ─────
+
+- (void)togglePreview:(id)sender {
+  QLPreviewPanel* ql = QLPreviewPanel.sharedPreviewPanel;
+  if (ql.visible) [ql orderOut:nil];
+  else if ([self selectedItems].count) {
+    [_window makeFirstResponder:_outline];
+    [ql makeKeyAndOrderFront:nil];
+  }
+}
+
+- (NSInteger)numberOfPreviewItemsInPreviewPanel:(QLPreviewPanel*)panel { return (NSInteger)[self selectedItems].count; }
+- (id<QLPreviewItem>)previewPanel:(QLPreviewPanel*)panel previewItemAtIndex:(NSInteger)i {
+  NSArray<Item*>* sel = [self selectedItems];
+  return i >= 0 && (NSUInteger)i < sel.count ? sel[(NSUInteger)i] : nil;
+}
+- (BOOL)previewPanel:(QLPreviewPanel*)panel handleEvent:(NSEvent*)e {
+  // Arrow keys move the selection in the list while the panel is up, like the Finder.
+  if (e.type == NSEventTypeKeyDown && e.charactersIgnoringModifiers.length == 1) {
+    unichar c = [e.charactersIgnoringModifiers characterAtIndex:0];
+    if (c == NSUpArrowFunctionKey || c == NSDownArrowFunctionKey) {
+      [_outline keyDown:e];
+      return YES;
+    }
+  }
+  return NO;
+}
+- (NSRect)previewPanel:(QLPreviewPanel*)panel sourceFrameOnScreenForPreviewItem:(id<QLPreviewItem>)item {
+  NSInteger row = [_outline rowForItem:item];
+  if (row < 0) return NSZeroRect;
+  NSRect r = [_outline frameOfCellAtColumn:0 row:row];
+  r = [_outline convertRect:r toView:nil];
+  return [_window convertRectToScreen:r];
+}
+
+// ───── emptying the Trash ─────
+
+- (void)emptyTrash:(id)sender {
+  NSArray<Item*>* items = _mode == Mode::Trash && _finderItems[(int)Mode::Trash] ? _flat : nil;
+  NSString* trashDir = [NSHomeDirectory() stringByAppendingPathComponent:@".Trash"];
+  if (!items) {
+    NSMutableArray<Item*>* found = [NSMutableArray new];
+    NSError* listErr = nil;
+    NSArray<NSString*>* names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:trashDir error:&listErr];
+    if (!names && listErr) {
+      NSAlert* a = [NSAlert new];
+      a.messageText = @"Stale isn't allowed to see the Trash";
+      a.informativeText = @"Give Stale Full Disk Access in System Settings › Privacy & Security, then try again.";
+      [a addButtonWithTitle:@"OK"];
+      [a beginSheetModalForWindow:_window completionHandler:nil];
+      return;
+    }
+    for (NSString* n in names) {
+      if ([n isEqual:@".DS_Store"]) continue;
+      Item* it = [Item new];
+      it.path = [trashDir stringByAppendingPathComponent:n];
+      it.name = n;
+      [found addObject:it];
+    }
+    items = found;
+  }
+  uint64_t total = 0;
+  for (Item* it in items) total += it.size;
+  NSAlert* a = [NSAlert new];
+  a.alertStyle = NSAlertStyleCritical;
+  a.messageText = items.count ? @"Empty the Trash?" : @"The Trash is already empty";
+  a.informativeText = items.count
+      ? [NSString stringWithFormat:@"%@ in %@ will be deleted permanently. This can't be undone.", total ? fmtBytes(total) : @"Everything", fmtCount(items.count, @"item")]
+      : @"";
+  if (items.count) [a addButtonWithTitle:@"Empty Trash"];
+  [a addButtonWithTitle:items.count ? @"Cancel" : @"OK"];
+  [a beginSheetModalForWindow:_window completionHandler:^(NSModalResponse r) {
+    if (!items.count || r != NSAlertFirstButtonReturn) return;
+    NSFileManager* fm = NSFileManager.defaultManager;
+    NSString* prefix = [trashDir stringByAppendingString:@"/"];
+    NSMutableArray<NSString*>* failures = [NSMutableArray new];
+    for (Item* it in items) {
+      // Only ever delete directly inside ~/.Trash, whatever the list says.
+      NSString* p = it.path.stringByStandardizingPath;
+      if (![p hasPrefix:prefix] || [p.stringByDeletingLastPathComponent isEqual:trashDir] == NO) continue;
+      NSError* err = nil;
+      if (![fm removeItemAtPath:p error:&err])
+        [failures addObject:[NSString stringWithFormat:@"%@: %@", it.name, err.localizedDescription ?: @"unknown error"]];
+    }
+    self->_finderItems[(int)Mode::Trash] = nil;
+    if (self->_mode == Mode::Trash) [self showMode:Mode::Trash];
+    else [self refreshFinderBadge:Mode::Trash];
+    if (failures.count) {
+      NSAlert* b = [NSAlert new];
+      b.alertStyle = NSAlertStyleCritical;
+      b.messageText = @"Some items couldn't be deleted";
+      b.informativeText = [failures componentsJoinedByString:@"\n"];
+      [b beginSheetModalForWindow:self->_window completionHandler:nil];
+    }
+  }];
 }
 
 // ───── actions ─────
@@ -2445,6 +3034,10 @@ struct RingSeg {
       [failures addObject:[NSString stringWithFormat:@"%@: %@", it.name, err.localizedDescription ?: @"unknown error"]];
     }
   }
+  if (_model.result && !_model.result->dirs.empty()) {
+    if (moved) rollup(*_model.result);
+    if (_root) [self syncItem:_root touched:{}];
+  }
   [_outline reloadData];
   [self selectionChanged];
   if (_model.result && !_model.result->dirs.empty()) {
@@ -2462,18 +3055,16 @@ struct RingSeg {
   }
 }
 
-// Remove from the tree and flat lists, and shrink every ancestor.
+// Remove from the tree and flat lists and from the scan model (the caller re-rolls totals).
 - (void)removeItem:(Item*)it {
-  for (Item* p = it.parent; p; p = p.parent) {
-    p.size = p.size >= it.size ? p.size - it.size : 0;
-    p.files = p.files >= it.files ? p.files - it.files : 0;
-  }
   if (it.parent) [it.parent.children removeObject:it];
   else if (_root && _root.children) [_root.children removeObject:it];
   NSMutableArray* flat = [_flat mutableCopy];
   [flat removeObject:it];
   _flat = flat;
   [_appItems removeObject:it];
+  for (int i = 0; i < (int)Mode::Count; ++i) [_finderItems[i] removeObject:it];
+  _finderItems[(int)Mode::Trash] = nil;  // it just gained an item
   if (!_model.result) return;
   ScanResult& r = *_model.result;
   if (!it.isDir) {
@@ -2485,41 +3076,17 @@ struct RingSeg {
   // Keep the scan model consistent so the summary and other modes don't resurrect it.
   auto sub = [](uint64_t& a, uint64_t b) { a -= std::min(a, b); };
   if (it.dirId >= 0) {
-    const DirNode gone = r.dirs[(size_t)it.dirId];
-    bool reclaim = gone.unit && categoryReclaimable(gone.category);
-    for (int32_t p = gone.parent; p >= 0; p = r.dirs[(size_t)p].parent) {
-      DirNode& a = r.dirs[(size_t)p];
-      sub(a.size, gone.size);
-      sub(a.files, gone.files);
-      sub(a.neverOpenedSize, gone.neverOpenedSize);
-      sub(a.reclaimableSize, reclaim ? gone.size : gone.reclaimableSize);
-      for (int b = 0; b < NBUCKETS; ++b) {
-        sub(a.bucketSize[b], gone.bucketSize[b]);
-        sub(a.reclaimableBucketSize[b], reclaim ? gone.bucketSize[b] : gone.reclaimableBucketSize[b]);
-      }
-    }
-    DirNode& d = r.dirs[(size_t)it.dirId];
-    if (d.parent >= 0) {
-      auto& sib = r.dirs[(size_t)d.parent].children;
-      sib.erase(std::remove(sib.begin(), sib.end(), it.dirId), sib.end());
-    }
-    d.path.clear();
-    d.size = 0;
+    markGone(r, it.dirId);
   } else if (!it.isDir) {
-    int32_t start = -1;
-    for (Item* p = it.parent; p && start < 0; p = p.parent) start = p.dirId;
-    int bucket = bucketFor(it.lastUsed, _model.now);
-    for (int32_t p = start; p >= 0; p = r.dirs[(size_t)p].parent) {
-      DirNode& a = r.dirs[(size_t)p];
-      sub(a.size, it.size);
-      sub(a.files, 1);
-      sub(a.bucketSize[bucket], it.size);
-      if (it.never) sub(a.neverOpenedSize, it.size);
+    int32_t owner = findDir(r, std_str(it.path.stringByDeletingLastPathComponent));
+    if (owner >= 0) {
+      DirOwn& o = r.dirs[(size_t)owner].own;
+      sub(o.size, it.size);
+      sub(o.files, 1);
+      sub(o.bucketSize[bucketFor(it.lastUsed, _model.now)], it.size);
+      if (it.never) sub(o.neverOpenedSize, it.size);
     }
   }
-  // Items removed from a flat list aren't linked to the browse tree; rebuild it lazily.
-  if (!it.parent && _mode != Mode::Browse && !r.dirs.empty()) _root = [self itemForDir:0 parent:nil];
-  else if (_root && !r.dirs.empty()) _root.size = r.dirs[0].size;
 }
 
 @end

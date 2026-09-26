@@ -5,11 +5,11 @@ ARCHS ?= arm64 x86_64
 ARCHFLAGS = $(foreach a,$(ARCHS),-arch $(a))
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=12.0
 OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
-LDFLAGS = $(ARCHFLAGS) -framework Foundation -framework CoreServices
+LDFLAGS = $(ARCHFLAGS) -framework Foundation -framework CoreServices -framework AppKit
 
 # Release metadata. VERSION is the user-facing version, BUILD the monotonically
 # increasing bundle version (defaults to the commit count).
-VERSION ?= 1.0.0
+VERSION ?= 1.2.0
 BUILD_NUMBER ?= $(shell git rev-list --count HEAD 2>/dev/null || echo 1)
 
 # Code signing. Default is ad-hoc (runs locally, Gatekeeper warns on other Macs).
@@ -26,7 +26,7 @@ NOTARY_PROFILE ?= stale
 
 BUILD = build
 SRC = src
-CORE = $(BUILD)/scan.o $(BUILD)/spotlight.o $(BUILD)/index.o
+CORE = $(BUILD)/scan.o $(BUILD)/spotlight.o $(BUILD)/index.o $(BUILD)/fsevents.o $(BUILD)/finders.o
 OBJS = $(CORE) $(BUILD)/main.o
 APP = $(BUILD)/Stale.app
 APP_BIN = $(APP)/Contents/MacOS/Stale
@@ -50,10 +50,10 @@ $(APP_BIN): $(CORE) $(BUILD)/app.o app/Info.plist app/Stale.entitlements $(ICON)
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	sed -e 's/@VERSION@/$(VERSION)/' -e 's/@BUILD@/$(BUILD_NUMBER)/' app/Info.plist > $(APP)/Contents/Info.plist
 	cp $(ICON) $(APP)/Contents/Resources/Stale.icns
-	$(CXX) $(CORE) $(BUILD)/app.o $(LDFLAGS) -framework Cocoa -o $@
+	$(CXX) $(CORE) $(BUILD)/app.o $(LDFLAGS) -framework Cocoa -framework Quartz -o $@
 	codesign -f $(SIGN_FLAGS) --entitlements app/Stale.entitlements $(APP)
 
-$(BUILD)/app.o: app/main.mm $(SRC)/scan.h $(SRC)/index.h | $(BUILD)
+$(BUILD)/app.o: app/main.mm $(SRC)/scan.h $(SRC)/index.h $(SRC)/fsevents.h $(SRC)/finders.h | $(BUILD)
 	$(CXX) $(OBJCXXFLAGS) $(ARCHFLAGS) -c $< -o $@
 
 $(BUILD)/mkicon: app/mkicon.mm | $(BUILD)
@@ -77,7 +77,7 @@ run: $(APP_BIN)
 $(BUILD)/%.o: $(SRC)/%.cpp $(SRC)/scan.h $(SRC)/index.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(ARCHFLAGS) -c $< -o $@
 
-$(BUILD)/%.o: $(SRC)/%.mm $(SRC)/scan.h | $(BUILD)
+$(BUILD)/%.o: $(SRC)/%.mm $(SRC)/scan.h $(SRC)/fsevents.h $(SRC)/finders.h | $(BUILD)
 	$(CXX) $(OBJCXXFLAGS) $(ARCHFLAGS) -c $< -o $@
 
 $(BUILD):

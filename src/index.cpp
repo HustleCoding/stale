@@ -13,7 +13,7 @@ namespace stale {
 namespace {
 
 const char kMagic[8] = {'S', 'T', 'A', 'L', 'E', 'I', 'D', 'X'};
-const uint32_t kVersion = 2;
+const uint32_t kVersion = 3;
 
 uint64_t fnv1a(const char* p, size_t n) {
   uint64_t h = 1469598103934665603ull;
@@ -124,40 +124,57 @@ std::string indexPath(const std::string& root) {
   return indexDir() + "/index-" + hex + ".stale";
 }
 
-std::string encodeIndex(const std::string& root, const ScanResult& r, double savedAt) {
+std::string encodeIndex(const std::string& root, const ScanResult& r, const IndexMeta& meta) {
   if (r.dirs.empty()) return {};
+  // Gone / never-scanned nodes are dropped; ids are renumbered, order (parents first) is kept.
+  std::vector<int32_t> remap(r.dirs.size(), -1);
+  int32_t live = 0;
+  for (size_t i = 0; i < r.dirs.size(); ++i) {
+    const DirNode& d = r.dirs[i];
+    bool keep = i == 0 || (!d.path.empty() && d.parent >= 0 && d.parent < static_cast<int32_t>(i) &&
+                           remap[static_cast<size_t>(d.parent)] >= 0);
+    if (keep) remap[i] = live++;
+  }
+
   Writer w;
-  w.buf.reserve(r.dirs.size() * 72 + r.bigFiles.size() * 96 + r.spotlight.size() * 96 + 256);
+  w.buf.reserve(static_cast<size_t>(live) * 48 + r.bigFiles.size() * 96 + r.spotlight.size() * 96 + 256);
   w.buf.append(kMagic, sizeof kMagic);
   w.u32(kVersion);
   w.u32(0);
-  w.f64(savedAt);
+  w.f64(meta.savedAt);
   w.str(root);
-  w.u64(r.files);
+  w.raw(meta.eventId);
+  w.u32(static_cast<uint32_t>(meta.volumeUUIDs.size()));
+  for (const auto& u : meta.volumeUUIDs) w.str(u);
+  w.u64(r.bigFileBytes);
   w.u64(r.errors);
   w.f64(r.now);
   w.f64(r.seconds);
   w.u64(r.spotlightHits);
 
-  w.u32(static_cast<uint32_t>(r.dirs.size()));
+  w.u32(static_cast<uint32_t>(live));
   for (size_t i = 0; i < r.dirs.size(); ++i) {
+    if (remap[i] < 0) continue;
     const DirNode& d = r.dirs[i];
-    // Children are stored by name and rebuilt from their parent's path on load.
-    bool gone = i != 0 && d.path.empty();  // trashed after the scan
-    w.str(i == 0 ? d.path : (d.parent >= 0 && !gone ? baseName(d.path) : std::string()));
-    w.i32(gone ? -1 : d.parent);
+    // Children are stored by name and rebuilt from their parent's path on load; totals are
+    // rebuilt from the own stats.
+    w.str(i == 0 ? d.path : baseName(d.path));
+    w.i32(i == 0 ? -1 : remap[static_cast<size_t>(d.parent)]);
     w.u8(static_cast<uint8_t>(d.category));
     w.u8(d.unit ? 1 : 0);
-    w.u64(d.size);
-    w.u64(d.files);
-    for (int b = 0; b < NBUCKETS; ++b) w.u64(d.bucketSize[b]);
-    w.u64(d.neverOpenedSize);
-    w.u64(d.reclaimableSize);
-    for (int b = 0; b < NBUCKETS; ++b) w.u64(d.reclaimableBucketSize[b]);
-    w.f64(d.lastUsed);
+    w.u64(d.own.size);
+    w.u64(d.own.files);
+    for (int b = 0; b < NBUCKETS; ++b) w.u64(d.own.bucketSize[b]);
+    w.u64(d.own.neverOpenedSize);
+    w.f64(d.own.lastUsed);
     w.f64(d.mdLastUsed);
-    w.u32(static_cast<uint32_t>(d.children.size()));
-    for (int32_t c : d.children) w.i32(c);
+    uint32_t nch = 0;
+    for (int32_t c : d.children)
+      if (c > static_cast<int32_t>(i) && c < static_cast<int32_t>(r.dirs.size()) && remap[static_cast<size_t>(c)] >= 0) ++nch;
+    w.u32(nch);
+    for (int32_t c : d.children)
+      if (c > static_cast<int32_t>(i) && c < static_cast<int32_t>(r.dirs.size()) && remap[static_cast<size_t>(c)] >= 0)
+        w.i32(remap[static_cast<size_t>(c)]);
   }
 
   w.u32(static_cast<uint32_t>(r.bigFiles.size()));
@@ -195,11 +212,11 @@ bool writeIndex(const std::string& file, const std::string& bytes) {
   return true;
 }
 
-bool saveIndex(const std::string& file, const std::string& root, const ScanResult& r, double savedAt) {
-  return writeIndex(file, encodeIndex(root, r, savedAt));
+bool saveIndex(const std::string& file, const std::string& root, const ScanResult& r, const IndexMeta& meta) {
+  return writeIndex(file, encodeIndex(root, r, meta));
 }
 
-bool loadIndex(const std::string& file, const std::string& root, ScanResult& out, double* savedAt) {
+bool loadIndex(const std::string& file, const std::string& root, ScanResult& out, IndexMeta* meta) {
   FILE* fp = fopen(file.c_str(), "rb");
   if (!fp) return false;
   struct stat st;
@@ -220,11 +237,16 @@ bool loadIndex(const std::string& file, const std::string& root, ScanResult& out
   Reader rd{buf.data() + sizeof kMagic, buf.data() + body};
   if (rd.u32() != kVersion) return false;
   rd.u32();
-  double saved = rd.f64();
+  IndexMeta m;
+  m.savedAt = rd.f64();
   if (rd.str() != root) return false;
+  m.eventId = rd.raw<uint64_t>();
+  uint32_t nuuid = rd.u32();
+  if (!rd.ok || nuuid > 64) return false;
+  for (uint32_t i = 0; i < nuuid && rd.ok; ++i) m.volumeUUIDs.push_back(rd.str());
 
   ScanResult r;
-  r.files = rd.u64();
+  r.bigFileBytes = rd.u64();
   r.errors = rd.u64();
   r.now = rd.f64();
   r.seconds = rd.f64();
@@ -239,13 +261,11 @@ bool loadIndex(const std::string& file, const std::string& root, ScanResult& out
     d.parent = rd.i32();
     uint8_t cat = rd.u8();
     d.unit = rd.u8() != 0;
-    d.size = rd.u64();
-    d.files = rd.u64();
-    for (int b = 0; b < NBUCKETS; ++b) d.bucketSize[b] = rd.u64();
-    d.neverOpenedSize = rd.u64();
-    d.reclaimableSize = rd.u64();
-    for (int b = 0; b < NBUCKETS; ++b) d.reclaimableBucketSize[b] = rd.u64();
-    d.lastUsed = rd.f64();
+    d.own.size = rd.u64();
+    d.own.files = rd.u64();
+    for (int b = 0; b < NBUCKETS; ++b) d.own.bucketSize[b] = rd.u64();
+    d.own.neverOpenedSize = rd.u64();
+    d.own.lastUsed = rd.f64();
     d.mdLastUsed = rd.f64();
     uint32_t nch = rd.u32();
     if (!rd.ok || cat >= NCATEGORIES || nch > ndirs) return false;
@@ -258,8 +278,8 @@ bool loadIndex(const std::string& file, const std::string& root, ScanResult& out
     }
     if (i == 0) {
       d.path = std::move(name);
-    } else if (d.parent >= 0) {
-      if (d.parent >= static_cast<int32_t>(i) || name.empty()) return false;
+    } else {
+      if (d.parent < 0 || d.parent >= static_cast<int32_t>(i) || name.empty()) return false;
       const std::string& pp = r.dirs[d.parent].path;
       d.path.reserve(pp.size() + 1 + name.size());
       d.path = pp;
@@ -289,8 +309,9 @@ bool loadIndex(const std::string& file, const std::string& root, ScanResult& out
   }
   if (!rd.ok || rd.p != rd.end) return false;
 
+  rollup(r);
   out = std::move(r);
-  if (savedAt) *savedAt = saved;
+  if (meta) *meta = std::move(m);
   return true;
 }
 
