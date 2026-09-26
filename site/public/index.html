@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stale: see what you actually use on your Mac</title>
+<meta name="description" content="Stale indexes your whole Mac and sorts every folder by when you last used it, so you can see what's safe to delete. Free, native, private.">
+<meta property="og:title" content="Stale for Mac">
+<meta property="og:description" content="See what you use, what you forgot, and what you can delete. Free, native, private.">
+<meta property="og:image" content="/screenshot.png">
+<link rel="icon" href="/icon.png">
+<style>
+  :root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fbfbfd; --card:#fff; --line:rgba(0,0,0,.08); --accent:#0071e3; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#f5f5f7; --muted:#a1a1a6; --bg:#0b0b0d; --card:#161618; --line:rgba(255,255,255,.1); --accent:#2997ff; } }
+  * { box-sizing:border-box; margin:0; }
+  body { font:17px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif; color:var(--fg); background:var(--bg); -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1080px; margin:0 auto; padding:0 24px; }
+  nav { display:flex; align-items:center; justify-content:space-between; padding:20px 0; }
+  nav a { color:var(--muted); text-decoration:none; font-size:15px; }
+  .brand { display:flex; align-items:center; gap:10px; font-weight:600; color:var(--fg); }
+  .brand img { width:28px; height:28px; }
+  header { text-align:center; padding:72px 0 48px; }
+  header img.icon { width:128px; height:128px; filter:drop-shadow(0 12px 24px rgba(0,0,0,.18)); }
+  h1 { font-size:clamp(40px,6vw,64px); line-height:1.05; letter-spacing:-.02em; margin:28px 0 16px; font-weight:700; }
+  .lead { font-size:21px; color:var(--muted); max-width:620px; margin:0 auto; }
+  .cta { margin-top:36px; display:flex; flex-direction:column; align-items:center; gap:12px; }
+  .btn { display:inline-flex; align-items:center; gap:10px; background:var(--accent); color:#fff; text-decoration:none; font-weight:600; padding:14px 28px; border-radius:980px; font-size:17px; transition:transform .15s, filter .15s; }
+  .btn:hover { filter:brightness(1.08); transform:translateY(-1px); }
+  .small { font-size:14px; color:var(--muted); }
+  .small code { font:13px ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--line); padding:3px 8px; border-radius:6px; user-select:all; }
+  .shot { margin:24px auto 0; }
+  .shot img { width:100%; height:auto; display:block; }
+  .features { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:20px; padding:72px 0; }
+  .f { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:28px; }
+  .f h3 { font-size:19px; margin-bottom:8px; }
+  .f p { color:var(--muted); font-size:15px; }
+  footer { border-top:1px solid var(--line); padding:28px 0 48px; display:flex; justify-content:space-between; flex-wrap:wrap; gap:12px; color:var(--muted); font-size:14px; }
+  footer a { color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <span class="brand"><img src="/icon.png" alt="">Stale</span>
+    <a href="https://github.com/HustleCoding/stale">GitHub</a>
+  </nav>
+
+  <header>
+    <img class="icon" src="/icon.png" alt="Stale app icon">
+    <h1>See what you actually<br>use on your Mac.</h1>
+    <p class="lead">Stale indexes your whole disk once and sorts everything by when you last opened it. Find the forgotten gigabytes and move them to the Trash.</p>
+    <div class="cta">
+      <a class="btn" href="/download">Download for Mac</a>
+      <span class="small">Free · macOS 12 or later · Apple silicon and Intel</span>
+      <span class="small">or <code>brew tap hustlecoding/stale https://github.com/HustleCoding/stale && brew install --cask stale</code></span>
+    </div>
+  </header>
+
+  <div class="shot"><img src="/screenshot.png" alt="Stale showing a Mac's disk usage by last use" width="1800" height="1261"></div>
+
+  <section class="features">
+    <div class="f"><h3>By last use</h3><p>Every folder sorted into this week, this month, last 6 months, over a year or never opened, using Spotlight's "last opened" dates.</p></div>
+    <div class="f"><h3>Safe to clean up</h3><p>Caches, build folders, duplicates, leftovers from deleted apps and old downloads. Everything goes to the Trash, never straight to deletion.</p></div>
+    <div class="f"><h3>Fast and always current</h3><p>Stale indexes once, then keeps up with changes in the background. It opens instantly, with no rescan on every launch.</p></div>
+    <div class="f"><h3>Private by design</h3><p>Stale only reads file sizes and dates. Nothing leaves your Mac: no account, no analytics.</p></div>
+  </section>
+
+  <footer>
+    <span>Stale is free and open source (MIT). Signed and notarized by Apple; updates install automatically.</span>
+    <span><a href="https://github.com/HustleCoding/stale/releases">Release notes</a> · <a href="https://github.com/HustleCoding/stale/issues">Report a problem</a></span>
+  </footer>
+</div>
+</body>
+</html>

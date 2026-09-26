@@ -163,3 +163,15 @@ signed build and marks the release as not notarized.
   the Trash until you empty it.
 - Sizes are allocated bytes (`st_blocks`), so APFS clones and sparse files are
   reported at what they actually occupy.
+
+## Website and Homebrew
+
+The landing page in `site/` is a Cloudflare Worker with static assets; `/download` redirects
+to the newest release's DMG. Deploy with `cd site && npx wrangler deploy`.
+
+Homebrew users can install from the cask in this repo:
+
+```
+brew tap hustlecoding/stale https://github.com/HustleCoding/stale
+brew install --cask stale
+```
