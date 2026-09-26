@@ -68,7 +68,13 @@ if command -v SetFile >/dev/null 2>&1; then
   SetFile -a V "$MNT/.VolumeIcon.icns" || true
 fi
 sync
-hdiutil detach -quiet -force "$MNT"
+# Spotlight or Finder can briefly hold the volume ("Resource busy"), so retry.
+for i in 1 2 3 4 5; do
+  hdiutil detach -quiet -force "$MNT" && break
+  [ "$i" = 5 ] && exit 1
+  sleep 2
+done
+MNT=""
 
 rm -f "$OUT"
 hdiutil convert -quiet "$RW" -format UDZO -imagekey zlib-level=9 -o "$OUT"
