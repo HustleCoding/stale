@@ -60,8 +60,9 @@ app: $(APP_BIN)
 test: $(BUILD)/stale_test
 	./$(BUILD)/stale_test
 
-$(BUILD)/stale_test: tests/stale_test.mm $(CORE) $(SRC)/scan.h $(SRC)/index.h $(SRC)/finders.h
-	$(CXX) $(OBJCXXFLAGS) $(ARCHFLAGS) -I$(SRC) tests/stale_test.mm $(CORE) $(LDFLAGS) -o $@
+TEST_OBJS = $(CORE) $(BUILD)/trash.o $(BUILD)/trash_mac.o
+$(BUILD)/stale_test: tests/stale_test.mm $(TEST_OBJS) $(SRC)/scan.h $(SRC)/index.h $(SRC)/finders.h $(SRC)/trash.h
+	$(CXX) $(OBJCXXFLAGS) $(ARCHFLAGS) -I$(SRC) tests/stale_test.mm $(TEST_OBJS) $(LDFLAGS) -o $@
 
 $(BUILD)/stale: $(OBJS)
 	$(CXX) $(OBJS) $(LDFLAGS) -o $@
