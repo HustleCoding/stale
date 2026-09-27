@@ -30,6 +30,22 @@ Requires macOS 12 or later, Apple silicon or Intel. On first launch Stale asks f
 **Full Disk Access** so it can see protected folders like Mail and Safari; it works
 without it, but those folders are left out.
 
+### Linux and Omarchy
+
+Stale also runs on Linux as a CLI plus a terminal UI (`stale tui`), with a Walker launcher
+entry, an Omarchy bar widget and a Waybar module. On Arch / Omarchy:
+
+```sh
+git clone https://github.com/HustleCoding/stale && cd stale/linux/arch && makepkg -si
+stale-omarchy install-plugin   # Omarchy 4: bar widget (disk used %, click opens the TUI)
+stale-omarchy install-waybar   # Omarchy 3 / plain Waybar: custom/stale module
+systemctl --user enable --now stale-refresh.timer   # optional: rescan ~ every 6 hours
+```
+
+Other distros: `make && sudo make install`. On Linux "last opened" comes from
+`~/.local/share/recently-used.xbel` (plus access times with `--atime`), removed items go
+to the freedesktop Trash, and the index lives in `~/.cache/stale`.
+
 ## What it does
 
 | Section | Shows |
@@ -84,7 +100,11 @@ make test         # fixture tests for the scanner, index and cleanup rules
 make install      # /usr/local/bin/stale and /Applications/Stale.app
 ```
 
-Needs the Xcode Command Line Tools. The only dependency, Sparkle, is downloaded on
+On Linux `make` builds just the CLI/TUI with g++ or clang (C++17, no dependencies) and
+`make install PREFIX=/usr` also installs the desktop entry, Omarchy plugin, Waybar module
+and systemd user timer.
+
+On macOS it needs the Xcode Command Line Tools. The only dependency, Sparkle, is downloaded on
 first build and checked against a pinned SHA-256. Signing, notarizing, releases,
 the website and the Homebrew cask are covered in [docs/RELEASING.md](docs/RELEASING.md).
 

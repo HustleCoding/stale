@@ -41,6 +41,50 @@ jobs:
           name: Stale-adhoc
           path: dist/*
 
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
+
+      - name: Build CLI + TUI
+        run: make
+
+      - name: Fixture tests (scanner, index, cleanup rules, freedesktop Trash)
+        run: make test
+
+      - name: Smoke-test CLI
+        run: |
+          ./build/stale --help
+          ./build/stale --json "$RUNNER_TEMP" | head -c 400
+          ./build/stale status --waybar
+
+      - name: Install layout
+        run: |
+          make install PREFIX=/usr DESTDIR="$RUNNER_TEMP/pkg"
+          find "$RUNNER_TEMP/pkg" -type f | sort
+          desktop-file-validate "$RUNNER_TEMP/pkg/usr/share/applications/stale.desktop" || true
+          jq -e '.id == "stale" and .kinds == ["bar-widget"]' linux/omarchy/manifest.json
+
+  arch:
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
+        with:
+          fetch-depth: 0
+
+      - name: makepkg
+        run: |
+          pacman -Syu --noconfirm --needed git
+          git config --system --add safe.directory '*'
+          useradd -m builder
+          cp linux/arch/PKGBUILD /home/builder/
+          sed -i "s|git+https://github.com/HustleCoding/stale.git|git+file://$GITHUB_WORKSPACE#commit=$GITHUB_SHA|" /home/builder/PKGBUILD
+          chown -R builder /home/builder
+          su builder -c 'cd ~ && makepkg -f --noconfirm'
+          pacman -U --noconfirm /home/builder/stale-git-r*.pkg.tar.zst
+          stale --help && stale status --waybar && stale-omarchy --help
+
   # Signed + notarized release. Runs on v* tags when the signing secrets exist:
   #   MACOS_CERTIFICATE_P12       base64 of the "Developer ID Application" .p12 export
   #   MACOS_CERTIFICATE_PASSWORD  password used when exporting the .p12
