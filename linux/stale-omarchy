@@ -30,7 +30,13 @@ install_plugin() {
   install -m644 "$SHARE/omarchy/manifest.json" "$SHARE/omarchy/BarWidget.qml" "$dest/"
   if command -v omarchy-plugin-validate >/dev/null; then omarchy-plugin-validate "$dest"; fi
   if command -v omarchy-plugin-enable >/dev/null; then
-    if command -v omarchy-shell >/dev/null; then omarchy-shell shell rescanPlugins >/dev/null; fi
+    # The shell rescans asynchronously, so wait for it to know the plugin.
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+    local i
+    for i in $(seq 40); do
+      omarchy-plugin-enable stale right 2>/dev/null && return
+      sleep 0.25
+    done
     omarchy-plugin-enable stale right
   else
     echo "Installed to $dest. Enable it from the Omarchy menu (Plugins) or: omarchy plugin enable stale right"
