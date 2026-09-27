@@ -2591,7 +2591,7 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
   _scroll.hidden = empty;
   [_outline sizeLastColumnToFit];
   if (!empty) [_window makeFirstResponder:_outline];
-  _bottom.hidden = empty;
+  _bottom.hidden = empty && _undoButton.hidden;
   _empty.hidden = !empty;
   if (empty && isFinderMode(m) && _finderUnreadable[(int)m]) {
     _emptyIcon.image = symbol(@"lock.shield", 40, NSFontWeightLight);
@@ -3009,6 +3009,7 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
   }
   v.textField.stringValue = [parts componentsJoinedByString:@"  ·  "];
   v.textField.textColor = NSColor.secondaryLabelColor;
+  v.toolTip = v.textField.stringValue;
   return v;
 }
 
@@ -3043,7 +3044,6 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
 }
 
 - (void)selectionChanged {
-  _undoButton.hidden = YES;
   NSArray<Item*>* sel = [self selectedItems];
   uint64_t total = 0;
   for (Item* it in sel) total += it.size;
@@ -3334,7 +3334,10 @@ static NSView* fdaStep(int n, NSString* text, NSView* accessory) {
     [um registerUndoWithTarget:self handler:^(StaleController* s) { [s putBack:undo]; }];
     [um setActionName:@"Move to Trash"];
     _undoButton.hidden = NO;
+    if (_mode != Mode::Overview) _bottom.hidden = NO;
   }
+  for (int i = 0; i < (int)Mode::Count; ++i)
+    if (isFinderMode((Mode)i) && _finderItems[i]) [self refreshFinderBadge:(Mode)i];
   if (failures.count) {
     NSAlert* a = [NSAlert new];
     a.alertStyle = NSAlertStyleCritical;
