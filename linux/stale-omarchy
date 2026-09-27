@@ -1,0 +1,60 @@
+#!/bin/bash
+# Omarchy helpers for Stale: open the TUI, and install the bar widget / Waybar module.
+set -euo pipefail
+
+APP_ID=org.omarchy.stale
+PREFIX="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+SHARE="$PREFIX/share/stale"
+
+usage() {
+  cat <<USAGE
+usage: stale-omarchy <command>
+
+  launch [path]      open (or focus) the Stale TUI in a terminal
+  install-plugin     Omarchy 4: install and enable the Stale bar widget (right section)
+  install-waybar     Omarchy 3 / Waybar: add the custom/stale module to ~/.config/waybar
+  refresh            rescan ~ in the background and update the bar
+USAGE
+}
+
+launch() {
+  if command -v omarchy-launch-or-focus-tui >/dev/null; then
+    exec omarchy-launch-or-focus-tui --app-id="$APP_ID" stale tui "$@"
+  fi
+  exec setsid xdg-terminal-exec --app-id="$APP_ID" -e stale tui "$@"
+}
+
+install_plugin() {
+  local dest="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/stale"
+  mkdir -p "$dest"
+  install -m644 "$SHARE/omarchy/manifest.json" "$SHARE/omarchy/BarWidget.qml" "$dest/"
+  if command -v omarchy-plugin-validate >/dev/null; then omarchy-plugin-validate "$dest"; fi
+  if command -v omarchy-plugin-enable >/dev/null; then
+    omarchy-plugin-enable stale right
+  else
+    echo "Installed to $dest. Enable it from the Omarchy menu (Plugins) or: omarchy plugin enable stale right"
+  fi
+}
+
+install_waybar() {
+  local dir="${XDG_CONFIG_HOME:-$HOME/.config}/waybar"
+  [[ -f $dir/config.jsonc ]] || { echo "stale-omarchy: $dir/config.jsonc not found" >&2; exit 1; }
+  install -Dm644 "$SHARE/waybar/stale.jsonc" "$dir/stale.jsonc"
+  install -Dm644 "$SHARE/waybar/stale.css" "$dir/stale.css"
+  cat <<NEXT
+Installed $dir/stale.jsonc and $dir/stale.css. To show it:
+  1. In $dir/config.jsonc add  "include": ["~/.config/waybar/stale.jsonc"],
+     and put "custom/stale" in "modules-right".
+  2. At the end of $dir/style.css add  @import "stale.css";
+  3. Run omarchy-restart-waybar (or restart waybar).
+NEXT
+}
+
+case "${1:-}" in
+  launch) shift; launch "$@" ;;
+  install-plugin) install_plugin ;;
+  install-waybar) install_waybar ;;
+  refresh) exec stale status --refresh --waybar ;;
+  -h|--help|"") usage ;;
+  *) usage >&2; exit 2 ;;
+esac

@@ -3,11 +3,13 @@
 #include "finders.h"
 #include "index.h"
 #include "scan.h"
+#include "trash.h"
 
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -291,12 +293,64 @@ static void testOldDownloads() {
 
 static void testTrash() {
   std::string h = root + "/trash";
-  writeFile(h + "/.Trash/old.bin", 1 << 20);
+  std::string t = trashFilesDir(h);
+  writeFile(t + "/old.bin", 1 << 20);
   ScanResult r = scanRoot(h);
   FinderResult res = findTrash(opts(r, h));
-  CHECK(find(res, h + "/.Trash/old.bin") != nullptr);
+  CHECK(find(res, t + "/old.bin") != nullptr);
   CHECK(!res.unreadable);
 }
+
+#ifndef __APPLE__
+static bool exists(const std::string& p) {
+  struct stat st;
+  return lstat(p.c_str(), &st) == 0;
+}
+
+static void testLinuxTrash() {
+  std::string data = root + "/xdg-data";
+  setenv("XDG_DATA_HOME", data.c_str(), 1);
+  std::string victim = root + "/linux-trash/a b.txt";
+  writeFile(victim, 4096);
+  std::string err;
+  CHECK(moveToTrash(victim, &err));
+  CHECK(!exists(victim));
+  CHECK(exists(data + "/Trash/files/a b.txt"));
+  std::ifstream info(data + "/Trash/info/a b.txt.trashinfo");
+  std::string text((std::istreambuf_iterator<char>(info)), std::istreambuf_iterator<char>());
+  CHECK(text.find("[Trash Info]") == 0);
+  CHECK(text.find("Path=" + root + "/linux-trash/a%20b.txt\n") != std::string::npos);
+  CHECK(text.find("DeletionDate=") != std::string::npos);
+
+  writeFile(victim, 4096, 'b');  // same name again gets a unique slot
+  CHECK(moveToTrash(victim, &err));
+  CHECK(exists(data + "/Trash/files/a b.txt.2"));
+  CHECK(exists(data + "/Trash/info/a b.txt.2.trashinfo"));
+
+  CHECK(deleteFromTrash(data + "/Trash/files/a b.txt", &err));
+  CHECK(!exists(data + "/Trash/files/a b.txt"));
+  CHECK(!exists(data + "/Trash/info/a b.txt.trashinfo"));
+  unsetenv("XDG_DATA_HOME");
+}
+
+static void testRecentlyUsed() {
+  std::string data = root + "/xdg-recent";
+  std::string dir = root + "/recent";
+  writeFile(dir + "/doc & notes.txt", 1024);
+  writeFile(data + "/recently-used.xbel", 0);
+  std::ofstream(data + "/recently-used.xbel")
+      << "<?xml version=\"1.0\"?>\n<xbel version=\"1.0\">\n"
+      << "  <bookmark href=\"file://" << dir << "/doc%20&amp;%20notes.txt\" added=\"2020-01-01T00:00:00Z\""
+      << " modified=\"2021-01-01T00:00:00.5Z\" visited=\"2022-06-01T12:00:00Z\"/>\n"
+      << "  <bookmark href=\"file:///elsewhere/x.txt\" visited=\"2022-06-01T12:00:00Z\"/>\n</xbel>\n";
+  setenv("XDG_DATA_HOME", data.c_str(), 1);
+  auto m = spotlightLastUsed(dir);
+  unsetenv("XDG_DATA_HOME");
+  CHECK(m.size() == 1);
+  auto it = m.find(dir + "/doc & notes.txt");
+  CHECK(it != m.end() && (long long)it->second == 1654084800LL);
+}
+#endif
 
 int main() {
   now = (double)time(nullptr);
@@ -313,7 +367,11 @@ int main() {
     void (*fn)();
   } tests[] = {{"classify", testClassify},     {"scan", testScan},         {"refresh", testRefresh},
                {"index", testIndex},           {"agent files", testAgentFiles}, {"duplicates", testDuplicates},
-               {"old downloads", testOldDownloads}, {"trash", testTrash}};
+               {"old downloads", testOldDownloads}, {"trash", testTrash},
+#ifndef __APPLE__
+               {"linux trash", testLinuxTrash},     {"recently-used", testRecentlyUsed},
+#endif
+  };
   for (const Test& test : tests) {
     int before = failures;
     test.fn();

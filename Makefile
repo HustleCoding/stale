@@ -1,4 +1,9 @@
 PREFIX ?= /usr/local
+
+# Linux (Omarchy, Arch, ...): CLI + TUI + desktop integration, see linux/linux.mk.
+ifeq ($(shell uname -s),Linux)
+include linux/linux.mk
+else
 CXX ?= clang++
 # Universal binary by default; ARCHS=arm64 for a quicker local build.
 ARCHS ?= arm64 x86_64
@@ -37,7 +42,7 @@ SPARKLE_FW = $(SPARKLE_DIR)/Sparkle.framework
 BUILD = build
 SRC = src
 CORE = $(BUILD)/scan.o $(BUILD)/spotlight.o $(BUILD)/index.o $(BUILD)/fsevents.o $(BUILD)/finders.o
-OBJS = $(CORE) $(BUILD)/main.o
+OBJS = $(CORE) $(BUILD)/main.o $(BUILD)/status.o $(BUILD)/trash.o $(BUILD)/trash_mac.o $(BUILD)/tui.o
 APP = $(BUILD)/Stale.app
 APP_BIN = $(APP)/Contents/MacOS/Stale
 ICON = $(BUILD)/Stale.icns
@@ -109,7 +114,7 @@ $(DMG_BG): $(BUILD)/mkdmgbg
 run: $(APP_BIN)
 	open $(APP)
 
-$(BUILD)/%.o: $(SRC)/%.cpp $(SRC)/scan.h $(SRC)/index.h | $(BUILD)
+$(BUILD)/%.o: $(SRC)/%.cpp $(wildcard $(SRC)/*.h) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(ARCHFLAGS) -c $< -o $@
 
 $(BUILD)/%.o: $(SRC)/%.mm $(SRC)/scan.h $(SRC)/fsevents.h $(SRC)/finders.h | $(BUILD)
@@ -164,3 +169,5 @@ clean:
 	rm -rf $(BUILD) $(DIST)
 
 .PHONY: all cli app test run dist notarize verify install uninstall clean
+
+endif

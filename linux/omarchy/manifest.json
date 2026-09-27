@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "stale",
+  "name": "Stale",
+  "version": "1.0.0",
+  "author": "HustleCoding",
+  "description": "Disk usage and reclaimable space; click to open Stale",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Stale",
+    "description": "Disk used %, reclaimable space; click opens the Stale TUI",
+    "category": "Info",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

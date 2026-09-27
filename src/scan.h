@@ -1,4 +1,6 @@
 #pragma once
+#include <sys/stat.h>
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -95,7 +97,14 @@ struct ScanResult {
   std::unordered_map<std::string, double> spotlight;  // path -> last opened, for on-demand file rows
 };
 
-// Spotlight: path -> last used (unix seconds) for everything under root.
+// Portable struct stat timestamps (seconds since the epoch).
+double statMtime(const struct ::stat& st);
+double statAtime(const struct ::stat& st);
+// Creation time of dirfd/name, 0 when the file system doesn't record it.
+double fileBirthTime(int dirfd, const char* name, const struct ::stat& st);
+
+// Spotlight (macOS) or ~/.local/share/recently-used.xbel (Linux): path -> last used (unix
+// seconds) for everything under root.
 std::unordered_map<std::string, double> spotlightLastUsed(const std::string& root);
 // Same, restricted to the given folders (recursively).
 std::unordered_map<std::string, double> spotlightLastUsedIn(const std::vector<std::string>& dirs);

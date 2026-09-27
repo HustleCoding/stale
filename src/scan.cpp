@@ -2,9 +2,11 @@
 
 #include <dirent.h>
 #include <fcntl.h>
-#include <sys/attr.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/attr.h>
 #include <sys/vnode.h>
+#endif
 #include <unistd.h>
 
 #include <algorithm>
@@ -51,6 +53,24 @@ Bucket bucketFor(double lastUsed, double now) {
   return FROZEN;
 }
 
+#ifdef __APPLE__
+double statMtime(const struct ::stat& st) { return st.st_mtimespec.tv_sec + st.st_mtimespec.tv_nsec * 1e-9; }
+double statAtime(const struct ::stat& st) { return st.st_atimespec.tv_sec + st.st_atimespec.tv_nsec * 1e-9; }
+double fileBirthTime(int, const char*, const struct ::stat& st) {
+  return st.st_birthtimespec.tv_sec + st.st_birthtimespec.tv_nsec * 1e-9;
+}
+#else
+double statMtime(const struct ::stat& st) { return st.st_mtim.tv_sec + st.st_mtim.tv_nsec * 1e-9; }
+double statAtime(const struct ::stat& st) { return st.st_atim.tv_sec + st.st_atim.tv_nsec * 1e-9; }
+double fileBirthTime(int dirfd, const char* name, const struct ::stat&) {
+  struct statx sx;
+  if (statx(dirfd, name, AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC, STATX_BTIME, &sx) != 0 ||
+      !(sx.stx_mask & STATX_BTIME))
+    return 0;
+  return sx.stx_btime.tv_sec + sx.stx_btime.tv_nsec * 1e-9;
+}
+#endif
+
 namespace {
 
 bool endsWith(const std::string& s, const char* suf) {
@@ -93,6 +113,7 @@ Category classifyDir(const std::string& path, const std::string& name, const std
   if (name == "node_modules") return CAT_NODE_MODULES;
   if (name == ".git") return CAT_GIT;
   if (name == ".Trash") return CAT_TRASH;
+  if (path == "/var/cache/pacman/pkg") return CAT_CACHE;
   if (endsWith(name, ".app")) return CAT_APP;
   if (inSet(name, {".next", ".turbo", ".nuxt", ".svelte-kit", ".parcel-cache", ".output",
                    ".angular", ".gradle", ".dart_tool", "DerivedData", ".build", ".vercel",
@@ -125,6 +146,7 @@ Category classifyDir(const std::string& path, const std::string& name, const std
   std::string relParent = relHome(parent, home);
 
   if (rel == "Downloads") return CAT_DOWNLOADS;
+  if (rel == ".local/share/Trash") return CAT_TRASH;
   if (relParent == "Library/Caches" || relParent == ".cache" || rel == "Library/Logs" ||
       inSet(rel, {".npm", ".yarn/cache", ".pnpm-store", "Library/pnpm", ".cargo/registry",
                   ".cargo/git", ".gradle/caches", ".m2/repository", "go/pkg/mod",
@@ -140,7 +162,14 @@ Category classifyDir(const std::string& path, const std::string& name, const std
                   "Library/Application Support/discord/Cache",
                   "Library/Application Support/Spotify/PersistentCache",
                   "Library/Application Support/Steam/steamapps/shadercache",
-                  ".ollama/models", ".cache/huggingface"}))
+                  ".ollama/models", ".cache/huggingface",
+                  // Linux (XDG) locations of the same tools
+                  ".local/share/pnpm/store", ".config/Code/Cache", ".config/Code/CachedData",
+                  ".config/Code/CachedExtensionVSIXs", ".config/Cursor/Cache", ".config/Cursor/CachedData",
+                  ".config/google-chrome/Default/Service Worker/CacheStorage",
+                  ".config/chromium/Default/Service Worker/CacheStorage", ".config/Slack/Cache",
+                  ".config/Slack/Service Worker/CacheStorage", ".config/discord/Cache",
+                  ".local/share/Steam/steamapps/shadercache", ".var/app/com.valvesoftware.Steam/.cache"}))
     return CAT_CACHE;
   if (inSet(rel, {"Library/Developer/Xcode/DerivedData", "Library/Developer/Xcode/Archives",
                   "Library/Developer/Xcode/iOS DeviceSupport",
@@ -152,7 +181,8 @@ Category classifyDir(const std::string& path, const std::string& name, const std
     return CAT_XCODE;
   if (relParent == "Library/Developer/CoreSimulator/Devices") return CAT_XCODE;
   if (inSet(rel, {"Library/Containers/com.docker.docker/Data", ".docker", ".orbstack",
-                  ".colima", ".lima", ".rd", "Library/Containers/com.docker.docker"}))
+                  ".colima", ".lima", ".rd", "Library/Containers/com.docker.docker",
+                  ".local/share/docker", ".local/share/containers"}))
     return CAT_DOCKER;
   return CAT_NONE;
 }
@@ -174,7 +204,9 @@ struct Entry {
   double mtime, atime, birth;
 };
 
+#ifdef __APPLE__
 double ts(const struct timespec& t) { return t.tv_sec + t.tv_nsec * 1e-9; }
+#endif
 
 std::string dirName(const std::string& p) {
   size_t slash = p.find_last_of('/');
@@ -332,6 +364,7 @@ struct Walker {
     }
   }
 
+#ifdef __APPLE__
   // getattrlistbulk returns hundreds of entries with their metadata per syscall, instead of
   // one fstatat per entry. Returns false if the file system doesn't support it.
   bool bulkList(int dfd, DirCtx& c, std::vector<char>& buf) {
@@ -387,6 +420,9 @@ struct Walker {
       }
     }
   }
+#else
+  bool bulkList(int, DirCtx&, std::vector<char>&) { return false; }
+#endif
 
   void readdirList(int dfd, DirCtx& c) {
     DIR* dp = fdopendir(dup(dfd));
@@ -394,6 +430,23 @@ struct Walker {
       errors.fetch_add(1);
       return;
     }
+#ifdef __linux__
+    // One statx per entry gives the birth time along with the usual fields.
+    const unsigned mask = STATX_TYPE | STATX_BLOCKS | STATX_MTIME | STATX_ATIME | STATX_BTIME;
+    struct statx sx;
+    while (struct dirent* de = readdir(dp)) {
+      if (de->d_name[0] == '.' && (de->d_name[1] == 0 || (de->d_name[1] == '.' && de->d_name[2] == 0)))
+        continue;
+      if (statx(dirfd(dp), de->d_name, AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC, mask, &sx) != 0) {
+        errors.fetch_add(1);
+        continue;
+      }
+      auto t = [](const struct statx_timestamp& x) { return x.tv_sec + x.tv_nsec * 1e-9; };
+      Entry e{de->d_name, S_ISDIR(sx.stx_mode), static_cast<uint64_t>(sx.stx_blocks) * 512, t(sx.stx_mtime),
+              t(sx.stx_atime), (sx.stx_mask & STATX_BTIME) ? t(sx.stx_btime) : 0};
+      onEntry(c, e);
+    }
+#else
     struct stat st;
     while (struct dirent* de = readdir(dp)) {
       if (de->d_name[0] == '.' && (de->d_name[1] == 0 || (de->d_name[1] == '.' && de->d_name[2] == 0)))
@@ -403,9 +456,10 @@ struct Walker {
         continue;
       }
       Entry e{de->d_name, S_ISDIR(st.st_mode), static_cast<uint64_t>(st.st_blocks) * 512,
-              ts(st.st_mtimespec), ts(st.st_atimespec), ts(st.st_birthtimespec)};
+              statMtime(st), statAtime(st), fileBirthTime(dirfd(dp), de->d_name, st)};
       onEntry(c, e);
     }
+#endif
     closedir(dp);
   }
 
@@ -428,7 +482,7 @@ struct Walker {
     double dirMtime = 0;
     if (haveSt) {
       own.size += static_cast<uint64_t>(st.st_blocks) * 512;
-      dirMtime = ts(st.st_mtimespec);
+      dirMtime = statMtime(st);
     }
     if (!bulkList(dfd, c, buf)) readdirList(dfd, c);
     if (own.files == 0 && subdirs.empty()) own.lastUsed = std::min(dirMtime, now);

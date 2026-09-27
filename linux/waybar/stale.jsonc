@@ -1,0 +1,13 @@
+// Stale module for Waybar. Include this file from config.jsonc and add "custom/stale" to a module list.
+{
+  "custom/stale": {
+    "exec": "stale status --waybar",
+    "return-type": "json",
+    "interval": 300,
+    "format": "\uf0a0  {}",
+    "tooltip": true,
+    "on-click": "stale-omarchy launch",
+    "on-click-right": "stale status --refresh --waybar >/dev/null && pkill -RTMIN+9 waybar",
+    "signal": 9
+  }
+}

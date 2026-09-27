@@ -1,6 +1,5 @@
-#import <Foundation/Foundation.h>
-
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -9,18 +8,27 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "scan.h"
+#include "status.h"
+#include "trash.h"
+#include "tui.h"
 
 using namespace stale;
 
 namespace {
 
 bool gColor = isatty(1);
+#ifdef __APPLE__
+const char* const kLastOpenedSource = "Spotlight";
+#else
+const char* const kLastOpenedSource = "recently-used";
+#endif
 std::string gHome;
 
 const char* C(const char* code) { return gColor ? code : ""; }
@@ -123,6 +131,7 @@ struct Args {
   std::string cmd = "report";
   std::string path;
   bool json = false, atime = false, spotlight = true, yes = false, dryRun = false, all = false;
+  bool waybar = false, refresh = false;
   int top = 25;
   int threads = 0;
   double olderDays = 180;
@@ -132,17 +141,19 @@ struct Args {
 
 void usage() {
   fprintf(stderr,
-          "stale — what you use, what you don't, and when you last touched it (macOS)\n\n"
+          "stale — what you use, what you don't, and when you last touched it\n\n"
           "usage:\n"
           "  stale [path]                 usage report for a directory (default: ~)\n"
           "  stale ls <path>              children of a directory by size, with last-used age\n"
           "  stale apps                   installed apps by last launch\n"
-          "  stale trash [path] [opts]    move reclaimable, unused folders to the Trash\n\n"
+          "  stale trash [path] [opts]    move reclaimable, unused folders to the Trash\n"
+          "  stale tui [path]             interactive browser: folders, reclaimable, cleanup finders\n"
+          "  stale status [--waybar]      one-line disk summary for status bars (--refresh rescans ~)\n\n"
           "options:\n"
           "  --top N          rows per section (default 25)\n"
           "  --json           machine-readable output\n"
           "  --atime          also treat file access time as usage\n"
-          "  --no-spotlight   skip Spotlight last-opened metadata\n"
+          "  --no-spotlight   skip last-opened metadata (Spotlight / recently-used.xbel)\n"
           "  --threads N      scanner threads (default: all cores)\n"
           "  --older AGE      trash: only folders unused for AGE (30d, 6mo, 1y; default 180d)\n"
           "  --category LIST  trash: node_modules,build,venv,cache,xcode,docker,trash (default all)\n"
@@ -161,6 +172,8 @@ Args parse(int argc, char** argv) {
     else if (s == "--no-spotlight") a.spotlight = false;
     else if (s == "--dry-run") a.dryRun = true;
     else if (s == "--all") a.all = true;
+    else if (s == "--waybar") a.waybar = true;
+    else if (s == "--refresh") a.refresh = true;
     else if (s == "-y" || s == "--yes") a.yes = true;
     else if (s == "--top" || s == "-n") a.top = atoi(next().c_str());
     else if (s == "--threads") a.threads = atoi(next().c_str());
@@ -177,7 +190,7 @@ Args parse(int argc, char** argv) {
     } else if (s == "-h" || s == "--help") { usage(); exit(0); }
     else if (s == "--no-color") gColor = false;
     else if (!s.empty() && s[0] == '-') { fprintf(stderr, "unknown option %s\n", s.c_str()); usage(); exit(2); }
-    else if (a.cmd == "report" && a.path.empty() && (s == "ls" || s == "apps" || s == "trash" || s == "report"))
+    else if (a.cmd == "report" && a.path.empty() && (s == "ls" || s == "apps" || s == "trash" || s == "report" || s == "tui" || s == "status"))
       a.cmd = s;
     else if (a.path.empty()) a.path = s;
     else a.extra.push_back(s);
@@ -262,9 +275,9 @@ int cmdReport(const Args& a) {
     return 0;
   }
 
-  printf("\n%sstale%s  %s  %s%llu files, %s, %.1fs, %zu Spotlight last-opened records%s%s\n\n",
+  printf("\n%sstale%s  %s  %s%llu files, %s, %.1fs, %zu %s last-opened records%s%s\n\n",
          BOLD, RESET, tilde(a.path).c_str(), DIM, (unsigned long long)r.files,
-         human(root.size).c_str(), r.seconds, r.spotlightHits,
+         human(root.size).c_str(), r.seconds, r.spotlightHits, kLastOpenedSource,
          r.errors ? (", " + std::to_string(r.errors) + " unreadable").c_str() : "", RESET);
 
   printf("%sWhen did you last use it?%s  %s(by size; last used = max(last opened, modified))%s\n",
@@ -343,13 +356,13 @@ int cmdLs(const Args& a) {
       if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
       if (fstatat(dirfd(dp), de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || S_ISDIR(st.st_mode)) continue;
       std::string full = a.path + "/" + de->d_name;
-      double mt = st.st_mtimespec.tv_sec, lu = mt;
-      if (a.atime) lu = std::max(lu, (double)st.st_atimespec.tv_sec);
+      double mt = std::floor(statMtime(st)), lu = mt;
+      if (a.atime) lu = std::max(lu, std::floor(statAtime(st)));
       auto it = md.find(full);
       bool hasMd = it != md.end();
       if (hasMd) lu = std::max(lu, it->second);
-      double birth = st.st_birthtimespec.tv_sec;
-      bool never = !hasMd && std::fabs(mt - birth) < 60 && (r.now - birth) > 30 * 86400.0;
+      double birth = std::floor(fileBirthTime(dirfd(dp), de->d_name, st));
+      bool never = !hasMd && birth > 0 && std::fabs(mt - birth) < 60 && (r.now - birth) > 30 * 86400.0;
       rows.push_back(Row{de->d_name, (uint64_t)st.st_blocks * 512, std::min(lu, r.now), false, never,
                          S_ISLNK(st.st_mode) ? "symlink" : "", 1});
     }
@@ -386,6 +399,7 @@ int cmdLs(const Args& a) {
   return 0;
 }
 
+#ifdef __APPLE__
 int cmdApps(const Args& a) {
   std::vector<std::string> roots = {"/Applications", gHome + "/Applications"};
   struct App { std::string path; uint64_t size; double launched; double modified; };
@@ -403,6 +417,83 @@ int cmdApps(const Args& a) {
       apps.push_back(App{d.path, d.size, d.mdLastUsed, d.lastUsed});
     }
   }
+#else
+// Linux has no launch records, so an app's last launch is its executable's access time
+// (relatime updates it at least once a day); Flatpak apps count their whole install.
+std::string resolveExec(const std::string& cmd) {
+  if (cmd.empty()) return "";
+  if (cmd[0] == '/') return access(cmd.c_str(), X_OK) == 0 ? cmd : "";
+  const char* path = getenv("PATH");
+  std::string p = path ? path : "/usr/local/bin:/usr/bin:/bin";
+  size_t start = 0;
+  while (start <= p.size()) {
+    size_t end = p.find(':', start);
+    if (end == std::string::npos) end = p.size();
+    std::string full = p.substr(start, end - start) + "/" + cmd;
+    if (end > start && access(full.c_str(), X_OK) == 0) return full;
+    start = end + 1;
+  }
+  return "";
+}
+
+int cmdApps(const Args& a) {
+  struct App { std::string path; uint64_t size; double launched; double modified; };
+  std::vector<App> apps;
+  std::set<std::string> seen;
+  double now = (double)time(nullptr);
+  const std::vector<std::string> dirs = {"/usr/share/applications", "/usr/local/share/applications",
+                                         gHome + "/.local/share/applications",
+                                         "/var/lib/flatpak/exports/share/applications",
+                                         gHome + "/.local/share/flatpak/exports/share/applications"};
+  for (const std::string& dir : dirs) {
+    DIR* dp = opendir(dir.c_str());
+    if (!dp) continue;
+    while (struct dirent* de = readdir(dp)) {
+      std::string n = de->d_name;
+      if (n.size() < 9 || n.compare(n.size() - 8, 8, ".desktop") != 0) continue;
+      FILE* f = fopen((dir + "/" + n).c_str(), "r");
+      if (!f) continue;
+      std::string exec, flatpak;
+      bool hidden = false, inEntry = false;
+      char line[4096];
+      while (fgets(line, sizeof line, f)) {
+        std::string l = line;
+        while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+        if (!l.empty() && l[0] == '[') { inEntry = l == "[Desktop Entry]"; continue; }
+        if (!inEntry) continue;
+        if (l.compare(0, 5, "Exec=") == 0 && exec.empty()) exec = l.substr(5);
+        else if (l == "NoDisplay=true" || l == "Hidden=true") hidden = true;
+        else if (l.compare(0, 10, "X-Flatpak=") == 0) flatpak = l.substr(10);
+      }
+      fclose(f);
+      if (hidden || exec.empty()) continue;
+      std::string target;
+      if (!flatpak.empty()) {
+        for (const std::string& root : {std::string("/var/lib/flatpak/app/"), gHome + "/.local/share/flatpak/app/"}) {
+          struct stat st;
+          if (stat((root + flatpak).c_str(), &st) == 0) { target = root + flatpak; break; }
+        }
+      } else {
+        std::string cmd = exec.substr(0, exec.find(' '));
+        if (cmd == "env" || cmd.find('=') != std::string::npos) continue;
+        target = resolveExec(cmd);
+      }
+      if (target.empty() || !seen.insert(target).second) continue;
+      struct stat st;
+      if (stat(target.c_str(), &st) != 0) continue;
+      App app{target, (uint64_t)st.st_blocks * 512, statAtime(st), statMtime(st)};
+      if (S_ISDIR(st.st_mode)) {
+        ScanResult r = doScan(a, target);
+        if (r.dirs.empty()) continue;
+        app.size = r.dirs[0].size;
+        app.launched = 0;
+        app.modified = r.dirs[0].lastUsed;
+      }
+      apps.push_back(app);
+    }
+    closedir(dp);
+  }
+#endif
   // Never launched first (biggest first), then least recently launched.
   std::sort(apps.begin(), apps.end(), [](const App& x, const App& y) {
     if ((x.launched <= 0) != (y.launched <= 0)) return x.launched <= 0;
@@ -420,7 +511,7 @@ int cmdApps(const Args& a) {
   }
   uint64_t total = 0, unused = 0;
   for (const App& x : apps) { total += x.size; if (x.launched <= 0 || bucketFor(x.launched, now) >= COLD) unused += x.size; }
-  printf("\n%sApps%s  %s%zu apps, %s; %s never launched or not in 6+ months%s  %s(Spotlight last-opened; least used first)%s\n\n",
+  printf("\n%sApps%s  %s%zu apps, %s; %s never launched or not in 6+ months%s  %s(least used first)%s\n\n",
          BOLD, RESET, DIM, apps.size(), human(total).c_str(), human(unused).c_str(), RESET, DIM, RESET);
   int shown = 0;
   for (const App& x : apps) {
@@ -470,19 +561,15 @@ int cmdTrash(const Args& a) {
   }
   uint64_t moved = 0;
   int failed = 0;
-  @autoreleasepool {
-    NSFileManager* fm = [NSFileManager defaultManager];
-    for (int32_t i : picks) {
-      const DirNode& d = r.dirs[i];
-      NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:d.path.c_str()]];
-      NSError* err = nil;
-      if ([fm trashItemAtURL:url resultingItemURL:nil error:&err]) {
-        moved += d.size;
-        printf("  %strashed%s %s\n", GREEN, RESET, tilde(d.path).c_str());
-      } else {
-        ++failed;
-        printf("  %sfailed%s  %s: %s\n", RED, RESET, tilde(d.path).c_str(), err.localizedDescription.UTF8String);
-      }
+  for (int32_t i : picks) {
+    const DirNode& d = r.dirs[i];
+    std::string err;
+    if (moveToTrash(d.path, &err)) {
+      moved += d.size;
+      printf("  %strashed%s %s\n", GREEN, RESET, tilde(d.path).c_str());
+    } else {
+      ++failed;
+      printf("  %sfailed%s  %s: %s\n", RED, RESET, tilde(d.path).c_str(), err.c_str());
     }
   }
   printf("\n%s moved to Trash%s — empty the Trash to free the space%s\n\n", human(moved).c_str(),
@@ -498,6 +585,7 @@ int main(int argc, char** argv) {
   if (getenv("NO_COLOR")) gColor = false;
   Args a = parse(argc, argv);
   struct stat st;
+  if (a.cmd == "status") return a.refresh ? refreshStatus(gHome, a.threads, a.waybar || a.json) : printStatus(gHome, a.waybar || a.json);
   if (a.cmd != "apps" && (stat(a.path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))) {
     fprintf(stderr, "stale: %s is not a directory\n", a.path.c_str());
     return 1;
@@ -505,5 +593,14 @@ int main(int argc, char** argv) {
   if (a.cmd == "ls") return cmdLs(a);
   if (a.cmd == "apps") return cmdApps(a);
   if (a.cmd == "trash") return cmdTrash(a);
+  if (a.cmd == "tui") {
+    TuiOptions t;
+    t.root = a.path;
+    t.home = gHome;
+    t.threads = a.threads;
+    t.atime = a.atime;
+    t.spotlight = a.spotlight;
+    return runTui(t);
+  }
   return cmdReport(a);
 }

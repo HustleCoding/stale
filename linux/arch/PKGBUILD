@@ -1,0 +1,38 @@
+# Maintainer: Florin Dobinciuc <florin.dobinciuc.dev@gmail.com>
+pkgname=stale-git
+_pkgname=stale
+pkgver=r0
+pkgrel=1
+pkgdesc="Disk usage by last use: what you use, what you don't, reclaimable space, cleanup (CLI + TUI, Omarchy bar widget)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/HustleCoding/stale"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('git' 'make' 'gcc')
+optdepends=('git: safety checks for AI agent worktrees'
+            'xdg-utils: open folders from the TUI'
+            'xdg-terminal-exec: launch the TUI from Walker / the bar')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=("$_pkgname::git+https://github.com/HustleCoding/stale.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+  cd "$_pkgname"
+  make PREFIX=/usr CXXFLAGS="$CXXFLAGS -std=c++17" LDFLAGS="$LDFLAGS"
+}
+
+check() {
+  cd "$_pkgname"
+  HOME="$srcdir" make test CXXFLAGS="$CXXFLAGS -std=c++17" LDFLAGS="$LDFLAGS"
+}
+
+package() {
+  cd "$_pkgname"
+  make PREFIX=/usr DESTDIR="$pkgdir" install
+}

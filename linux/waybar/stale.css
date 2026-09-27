@@ -1,0 +1,11 @@
+#custom-stale {
+  margin: 0 7.5px;
+}
+
+#custom-stale.warning {
+  color: #e5c07b;
+}
+
+#custom-stale.critical {
+  color: #e06c75;
+}

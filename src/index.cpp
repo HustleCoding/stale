@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
 #include <cstring>
 
 namespace stale {
@@ -115,7 +116,13 @@ std::string baseName(const std::string& path) {
 
 std::string indexDir() {
   const char* h = getenv("HOME");
+#ifdef __APPLE__
   return std::string(h ? h : "") + "/Library/Application Support/Stale";
+#else
+  const char* xdg = getenv("XDG_CACHE_HOME");
+  if (xdg && xdg[0] == '/') return std::string(xdg) + "/stale";
+  return std::string(h ? h : "") + "/.cache/stale";
+#endif
 }
 
 std::string indexPath(const std::string& root) {

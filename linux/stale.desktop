@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Stale
+GenericName=Disk Usage Analyzer
+Comment=What you use, what you don't, and when you last touched it
+Exec=stale-omarchy launch
+Icon=stale
+Terminal=false
+Categories=System;Utility;Filesystem;
+Keywords=disk;usage;space;cleanup;storage;duplicates;
+StartupWMClass=org.omarchy.stale
+StartupNotify=true
