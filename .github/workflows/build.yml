@@ -69,13 +69,15 @@ jobs:
     runs-on: ubuntu-24.04
     container: archlinux:base-devel
     steps:
+      - name: Install git (so checkout makes a real clone for makepkg)
+        run: pacman -Syu --noconfirm --needed git
+
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
         with:
           fetch-depth: 0
 
       - name: makepkg
         run: |
-          pacman -Syu --noconfirm --needed git
           git config --system --add safe.directory '*'
           useradd -m builder
           cp linux/arch/PKGBUILD /home/builder/
